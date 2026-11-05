@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -e
 
-REPO_RAW_URL="https://raw.githubusercontent.com/TheAstro9aut/astro-tun/main"
+REPO_RAW_URL="https://raw.githubusercontent.com/TheAstro9aut/Astro-tun/main"
 INSTALL_DIR="/opt/astro-tun"
 BIN_PATH="/usr/local/bin/astro-tun"
 
