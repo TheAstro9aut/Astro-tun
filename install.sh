@@ -26,7 +26,7 @@ elif command -v pacman &>/dev/null; then
     pacman -Sy --noconfirm --needed curl wget unzip jq socat iproute2 openbsd-netcat bc python libcap >/dev/null 2>&1
 fi
 
-mkdir -p "$INSTALL_DIR"/{log,libs,configs}
+mkdir -p "$INSTALL_DIR"/{log,libs,configs,results}
 
 echo -e "${CYAN}[*] Downloading Astro Tun wizard...${NC}"
 if [[ -f "./astro-tun.sh" ]]; then
@@ -37,6 +37,6 @@ fi
 
 chmod +x "$BIN_PATH"
 
-echo -e "${GREEN}[✓] Astro Tun installed successfully! You can run it anytime by typing: astro-tun${NC}"
+echo -e "${GREEN}[✓] Astro Tun installed successfully! Run it anytime by typing: astro-tun${NC}"
 sleep 1
 exec "$BIN_PATH"
