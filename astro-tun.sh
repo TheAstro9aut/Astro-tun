@@ -2,14 +2,15 @@
 
 # ==============================================================================
 # ASTRO TUN - WaterWall Tunneling & Packet Probing Wizard
-# Repository Target: https://github.com/radkesvat/WaterWall
-# Docs Target:       https://radkesvat.github.io/WaterWall-Docs/
+# Repository: https://github.com/TheAstro9aut/Astro-tun
+# WaterWall:  https://github.com/radkesvat/WaterWall
 # ==============================================================================
 
 WW_DIR="/opt/astro-tun"
 WW_BIN="${WW_DIR}/Waterwall"
 WW_VER_FILE="${WW_DIR}/.version"
 WW_CORE_JSON="${WW_DIR}/core.json"
+ASTROTUN_BIN="/usr/local/bin/astro-tun"
 WW_REPO="radkesvat/WaterWall"
 WW_API_LATEST="https://api.github.com/repos/${WW_REPO}/releases/latest"
 
@@ -108,17 +109,13 @@ detect_compatible_asset() {
     fi
 
     local asset_url=""
-    local asset_name=""
 
     if [[ "$arch" == "x86_64" || "$arch" == "amd64" ]]; then
         if [[ "$has_avx2" == "true" ]]; then
-            # Prefer modern clang/gcc x64 build (AVX2 / standard x64 without old-cpu)
             asset_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("linux.*x64"; "i")) | select(.name | test("old-cpu"; "i") | not) | .browser_download_url' | head -n1)
         else
-            # Fallback for older x86_64 CPUs without AVX2
             asset_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("linux.*x64.*old-cpu"; "i")) | .browser_download_url' | head -n1)
         fi
-        # Generic x64 fallback if specific filter returned empty
         if [[ -z "$asset_url" || "$asset_url" == "null" ]]; then
             asset_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("linux.*(x64|amd64)"; "i")) | .browser_download_url' | head -n1)
         fi
@@ -263,10 +260,7 @@ generate_probe_configs() {
     local this_ip="$1"
     local peer_ip="$2"
     local role="$3" # "iran" or "kharej"
-    local iface
-    iface=$(get_default_iface)
 
-    # Generate both config_probe_iran.json and config_probe_kharej.json next to Waterwall
     local iran_ip="$this_ip"
     local kharej_ip="$peer_ip"
     if [[ "$role" == "kharej" ]]; then
@@ -398,7 +392,6 @@ run_bidirectional_probe_engine() {
     echo -e "${CYAN}[*] Step 1/3: Launching WaterWall Core with ${BOLD}${active_cfg}${NC}${CYAN}...${NC}"
     rm -f "${WW_DIR}/log/"*.log 2>/dev/null
 
-    # Run WaterWall probe core for 6 seconds in background to record native node logs
     (
         cd "$WW_DIR" || exit
         timeout 6 "$WW_BIN" > "${WW_DIR}/log/stdout.log" 2>&1
@@ -417,7 +410,6 @@ run_bidirectional_probe_engine() {
     echo -e "${CYAN}[*] Step 2/3: Running Bidirectional Raw IP Protocol & Speed Benchmark (Both Ways)...${NC}"
     echo -e "${YELLOW}    Make sure Packet Tester is also running on Peer (${peer_ip}) with the matching port (${sync_port}).${NC}"
 
-    # Python3 helper uses raw sockets + TCP/UDP streams to test connectivity & speed both ways
     python3 - "$this_ip" "$peer_ip" "$role" "$sync_port" "${WW_DIR}/log/core.log" << 'PYEOF'
 import sys, socket, struct, time, json, select, os
 
@@ -445,7 +437,6 @@ PROTOCOLS = [
 MAGIC = b"ASTROTUN_PROBE_V1"
 
 def send_raw_probes(target_ip):
-    results = {}
     for name, proto_num, _ in PROTOCOLS:
         if name in ("TCP", "UDP"):
             continue
@@ -454,7 +445,6 @@ def send_raw_probes(target_ip):
             s.settimeout(0.4)
             payload = MAGIC + struct.pack("!B", proto_num) + (b"X" * 512)
             if proto_num == 1:
-                # Valid ICMP Echo Request header (type 8, code 0)
                 header = struct.pack("!BBHHH", 8, 0, 0, 1234, 1)
                 chksum = 0
                 pkt = header + payload
@@ -487,16 +477,11 @@ def listen_raw_probes(duration=3.5):
             pass
 
     end_time = time.time() + duration
-    bytes_counter = {p[1]: 0 for p in PROTOCOLS}
-    first_seen = {}
-    last_seen = {}
-
     while time.time() < end_time:
         rlist = [s for _, s in raw_socks]
         if not rlist:
             break
         readable, _, _ = select.select(rlist, [], [], 0.2)
-        now = time.time()
         for s in readable:
             try:
                 data, addr = s.recvfrom(65535)
@@ -504,10 +489,6 @@ def listen_raw_probes(duration=3.5):
                     for pnum, sock_obj in raw_socks:
                         if sock_obj == s:
                             received_protos.add(pnum)
-                            bytes_counter[pnum] += len(data)
-                            if pnum not in first_seen:
-                                first_seen[pnum] = now
-                            last_seen[pnum] = now
             except Exception:
                 pass
 
@@ -523,7 +504,6 @@ def test_tcp_udp_and_sync():
         "latency_ms": {}
     }
 
-    # Establish control channel on sync_port to coordinate bidirectional testing
     ctrl_sock = None
     is_server = (role == "kharej")
 
@@ -551,20 +531,17 @@ def test_tcp_udp_and_sync():
             except Exception:
                 time.sleep(1.0)
 
-    peer_ synced = ctrl_sock is not None
+    peer_synced = ctrl_sock is not None
     if peer_synced:
         print("    [✓] Peer connected! Executing synchronized two-way protocol & speed test...")
         ctrl_sock.settimeout(10.0)
-        # TCP is verified open both ways since control channel succeeded
         t0 = time.time()
         ctrl_sock.sendall(b"PING_TEST")
         _ = ctrl_sock.recv(32)
         rtt = round((time.time() - t0) * 1000.0, 2)
 
-        # Measure TCP throughput Upload (This -> Peer) and Download (Peer -> This)
         chunk = b"W" * 32768
         if not is_server:
-            # Upload test (1.2 sec)
             t_up = time.time()
             sent_b = 0
             while time.time() - t_up < 1.2:
@@ -575,7 +552,6 @@ def test_tcp_udp_and_sync():
             ctrl_sock.sendall(b"EOF_UP")
             up_mbps = round((sent_b * 8) / ((time.time() - t_up) * 1e6), 2)
 
-            # Download test
             t_dn = time.time()
             recv_b = 0
             while time.time() - t_dn < 2.0:
@@ -589,7 +565,6 @@ def test_tcp_udp_and_sync():
                     break
             dn_mbps = round((recv_b * 8) / (max(time.time() - t_dn, 0.1) * 1e6), 2)
         else:
-            # Server receives upload first
             t_dn = time.time()
             recv_b = 0
             while time.time() - t_dn < 2.0:
@@ -603,7 +578,6 @@ def test_tcp_udp_and_sync():
                     break
             dn_mbps = round((recv_b * 8) / (max(time.time() - t_dn, 0.1) * 1e6), 2)
 
-            # Server sends download
             t_up = time.time()
             sent_b = 0
             while time.time() - t_up < 1.2:
@@ -619,17 +593,14 @@ def test_tcp_udp_and_sync():
         local_report["speed_down_mbps"][6] = dn_mbps
         local_report["latency_ms"][6] = rtt
 
-        # UDP bidirectional test on sync_port + 1
         udp_port = sync_port + 1
         u_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         u_sock.bind(("0.0.0.0", udp_port))
         u_sock.settimeout(1.5)
         u_pkt = MAGIC + b"UDP_SPEED_" + (b"U" * 1200)
-        u_sent = 0
-        t_u = time.time()
         for _ in range(150):
             try:
-                u_sent += u_sock.sendto(u_pkt, (peer_ip, udp_port))
+                u_sock.sendto(u_pkt, (peer_ip, udp_port))
             except Exception:
                 pass
         u_recv = 0
@@ -643,7 +614,6 @@ def test_tcp_udp_and_sync():
                 break
         u_sock.close()
 
-        # Raw protocols exchange
         if not is_server:
             send_raw_probes(peer_ip)
             rx_raw = listen_raw_probes(2.5)
@@ -654,23 +624,19 @@ def test_tcp_udp_and_sync():
         if u_recv > 0:
             rx_raw.add(17)
 
-        # Exchange received protocol sets over ctrl_sock so both sides know TX & RX status
         my_rx_list = sorted(list(rx_raw))
         try:
-            msg = json.dumps({"rx": my_rx_list, "u_mbps": round((u_recv * 8) / 1.5e6, 2)}).encode()
+            msg = json.dumps({"rx": my_rx_list}).encode()
             ctrl_sock.sendall(struct.pack("!I", len(msg)) + msg)
             hdr = ctrl_sock.recv(4)
             if len(hdr) == 4:
                 plen = struct.unpack("!I", hdr)[0]
                 peer_data = json.loads(ctrl_sock.recv(plen).decode())
                 peer_rx_set = set(peer_data.get("rx", []))
-                peer_u_mbps = peer_data.get("u_mbps", 0.0)
             else:
                 peer_rx_set = set()
-                peer_u_mbps = 0.0
         except Exception:
             peer_rx_set = set()
-            peer_u_mbps = 0.0
 
         ctrl_sock.close()
 
@@ -681,7 +647,6 @@ def test_tcp_udp_and_sync():
             rx_state = "OPEN" if pnum in rx_raw else "BLOCKED"
             local_report["tx_rx_open"][pnum] = (tx_state, rx_state)
             if tx_state == "OPEN" or rx_state == "OPEN":
-                # Estimate channel throughput based on measured link capacity & protocol overhead
                 factor = 1.05 if pnum in (4, 41, 47, 50, 115) else (1.08 if pnum == 17 else 0.45)
                 local_report["speed_up_mbps"][pnum] = round(up_mbps * factor, 2) if tx_state == "OPEN" else 0.0
                 local_report["speed_down_mbps"][pnum] = round(dn_mbps * factor, 2) if rx_state == "OPEN" else 0.0
@@ -695,7 +660,6 @@ def test_tcp_udp_and_sync():
         send_raw_probes(peer_ip)
         rx_raw = listen_raw_probes(3.0)
 
-        # Also inspect WaterWall core.log for any PacketReceiver detections
         if os.path.exists(ww_log_path):
             try:
                 with open(ww_log_path, "r", errors="ignore") as f:
@@ -706,7 +670,6 @@ def test_tcp_udp_and_sync():
             except Exception:
                 pass
 
-        # Quick ICMP ping check
         icmp_ok = (os.system(f"ping -c 2 -W 1 {peer_ip} >/dev/null 2>&1") == 0)
         if icmp_ok:
             rx_raw.add(1)
@@ -718,7 +681,6 @@ def test_tcp_udp_and_sync():
             local_report["speed_down_mbps"][pnum] = 0.0
             local_report["latency_ms"][pnum] = 0.0
 
-    # Render summary table
     print("\n" + "═" * 98)
     print(f" BIDIRECTIONAL PROTOCOL & SPEED SUMMARY ({this_ip} <===> {peer_ip})")
     print("═" * 98)
@@ -896,12 +858,56 @@ menu_update_core() {
     fi
 }
 
+menu_uninstall() {
+    print_banner
+    echo -e "${BOLD}${RED}>>> Complete Uninstall (Astro Tun + WaterWall Core + All Tunnels)${NC}"
+    echo -e "${BLUE}──────────────────────────────────────────────────────────────${NC}"
+    echo -e "${YELLOW}This will permanently remove:${NC}"
+    echo -e "  • All running WaterWall processes and systemd tunnel services"
+    echo -e "  • WaterWall Core binary, configs, logs, and probes in ${BOLD}${WW_DIR}${NC}"
+    echo -e "  • The global ${BOLD}astro-tun${NC} command at ${BOLD}${ASTROTUN_BIN}${NC}"
+    echo ""
+    echo -e "  ${RED}yes)${NC} Confirm Complete Uninstall"
+    echo -e "  ${CYAN}0)${NC}   Cancel and Go Back"
+    echo ""
+    read -rp "$(echo -e "${RED}Type 'yes' to wipe everything, or '0' to go back: ${NC}")" confirm
+
+    if is_back "$confirm" || [[ "${confirm,,}" != "yes" ]]; then
+        echo -e "${GREEN}[*] Uninstall cancelled.${NC}"
+        sleep 1
+        return 0
+    fi
+
+    echo ""
+    echo -e "${CYAN}[*] Stopping running WaterWall processes...${NC}"
+    pkill -9 -f "${WW_BIN}" 2>/dev/null || true
+
+    echo -e "${CYAN}[*] Stopping and removing any Astro Tun / WaterWall systemd services...${NC}"
+    for svc in /etc/systemd/system/astro-tun*.service /etc/systemd/system/waterwall*.service; do
+        [[ -e "$svc" ]] || continue
+        local svc_name
+        svc_name=$(basename "$svc")
+        systemctl stop "$svc_name" 2>/dev/null || true
+        systemctl disable "$svc_name" 2>/dev/null || true
+        rm -f "$svc"
+    done
+    systemctl daemon-reload 2>/dev/null || true
+
+    echo -e "${CYAN}[*] Removing installation directory (${WW_DIR})...${NC}"
+    rm -rf "${WW_DIR}"
+
+    echo -e "${CYAN}[*] Removing astro-tun binary (${ASTROTUN_BIN})...${NC}"
+    rm -f "${ASTROTUN_BIN}"
+
+    echo -e "${GREEN}[✓] Astro Tun, WaterWall Core, tunnels, and all configs have been completely removed.${NC}"
+    exit 0
+}
+
 # ==============================================================================
 # MAIN ENTRYPOINT
 # ==============================================================================
 
 main_menu() {
-    # Automatic core check on startup as requested
     check_and_install_core "false"
 
     while true; do
@@ -916,21 +922,23 @@ main_menu() {
         echo -e "  ${GREEN}2)${NC} Manage Tunnels"
         echo -e "  ${GREEN}3)${NC} Packet Tester (Bidirectional Probe & Speed Test)"
         echo -e "  ${GREEN}4)${NC} Update Core"
-        echo -e "  ${RED}0)${NC} Exit"
+        echo -e "  ${RED}5)${NC} Uninstall Astro Tun (Wipe Everything)"
+        echo -e "  ${CYAN}0)${NC} Exit"
         echo -e "${BLUE}──────────────────────────────────────────────────────────────${NC}"
-        read -rp "$(echo -e "${CYAN}Select an option [0-4]: ${NC}")" main_choice
+        read -rp "$(echo -e "${CYAN}Select an option [0-5]: ${NC}")" main_choice
 
         case "${main_choice,,}" in
             1) menu_create_tunnel ;;
             2) menu_manage_tunnels ;;
             3) menu_packet_tester ;;
             4) menu_update_core ;;
+            5) menu_uninstall ;;
             0|e|exit|q|quit|b|back)
                 echo -e "${GREEN}Exiting Astro Tun. Goodbye!${NC}"
                 exit 0
                 ;;
             *)
-                echo -e "${RED}[!] Invalid selection. Please choose 0-4.${NC}"
+                echo -e "${RED}[!] Invalid selection. Please choose 0-5.${NC}"
                 sleep 1
                 ;;
         esac
