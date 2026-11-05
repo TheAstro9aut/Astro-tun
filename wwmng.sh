@@ -40,24 +40,21 @@ handle_interrupt() {
     trap '' INT TERM
     echo -e "\n\n${RED}${BOLD}[!] Ctrl+C detected! Cancelling active operations and rolling back...${NC}"
 
-    # 1. Kill any running WaterWall or probe child processes spawned by this session
     if [[ -n "$ACTIVE_WW_PID" ]] && kill -0 "$ACTIVE_WW_PID" 2>/dev/null; then
         echo -e "${YELLOW}    -> Stopping active WaterWall process (PID: ${ACTIVE_WW_PID})...${NC}"
-        kill -9 "$ACTIVE_WW_PID" 2>/dev/null || true
+        kill -9 "$ACTIVE_WW_PID" 2>/dev/null
     fi
     if [[ -n "$ACTIVE_PY_PID" ]] && kill -0 "$ACTIVE_PY_PID" 2>/dev/null; then
         echo -e "${YELLOW}    -> Stopping active Packet Probe engine (PID: ${ACTIVE_PY_PID})...${NC}"
-        kill -9 "$ACTIVE_PY_PID" 2>/dev/null || true
+        kill -9 "$ACTIVE_PY_PID" 2>/dev/null
     fi
-    pkill -9 -f "${WW_BIN}" 2>/dev/null || true
+    pkill -9 -f "${WW_BIN}" 2>/dev/null
 
-    # 2. Remove temporary download/extraction directories
     if [[ -n "$ACTIVE_TMP_DIR" && -d "$ACTIVE_TMP_DIR" ]]; then
         echo -e "${YELLOW}    -> Removing temporary directory (${ACTIVE_TMP_DIR})...${NC}"
         rm -rf "$ACTIVE_TMP_DIR"
     fi
 
-    # 3. Roll back uncommitted/interrupted files created during the current step
     if [[ ${#ROLLBACK_FILES[@]} -gt 0 ]]; then
         for f in "${ROLLBACK_FILES[@]}"; do
             if [[ -e "$f" ]]; then
@@ -67,7 +64,6 @@ handle_interrupt() {
         done
     fi
 
-    # 4. Restore previous core.json backup if one was snapshotted
     if [[ -n "$BACKUP_CORE_JSON" && -f "$BACKUP_CORE_JSON" ]]; then
         mv -f "$BACKUP_CORE_JSON" "$WW_CORE_JSON"
         echo -e "${YELLOW}    -> Restored previous core.json configuration.${NC}"
@@ -79,7 +75,6 @@ handle_interrupt() {
 
 trap handle_interrupt INT TERM
 
-# Ensure root privileges
 if [[ $EUID -ne 0 ]]; then
     echo -e "${RED}[!] Waterwall-Manager (wwmng) must be run as root (needed for RawSocket & TUN capabilities).${NC}"
     exit 1
@@ -101,13 +96,16 @@ print_banner() {
     echo -e "${CYAN}${BOLD}║${NC}  ${MAGENTA}╚███╔███╔╝██║  ██║   ██║   ███████╗██║  ██║╚███╔███╔╝██║  ██║███████╗███████╗${NC}${CYAN}${BOLD}║${NC}"
     echo -e "${CYAN}${BOLD}║${NC}  ${MAGENTA} ╚══╝╚══╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝ ╚═╝  ╚═╝╚══════╝╚══════╝${NC}${CYAN}${BOLD}║${NC}"
     echo -e "${CYAN}${BOLD}║${NC}               ${WHITE}───  W A T E R W A L L - M A N A G E R  ───${NC}                ${CYAN}${BOLD}║${NC}"
-    echo -e "${CYAN}${BOLD}║${NC}            ${YELLOW}Command: wwmng  │  Press Ctrl+C anytime to Rollback${NC}           ${CYAN}${BOLD}║${NC}"
+    echo -e "${CYAN}${BOLD}║${NC}            ${YELLOW}Command: wwmng   *   Press Ctrl+C anytime to Rollback${NC}          ${CYAN}${BOLD}║${NC}"
     echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════════════════════════════╝${NC}"
 }
 
 is_back() {
     local input="${1,,}"
-    [[ "$input" == "0" || "$input" == "b" || "$input" == "back" ]]
+    case "$input" in
+        0|b|back) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 prompt_input() {
@@ -140,10 +138,14 @@ pause_back() {
 }
 
 get_public_ip() {
-    local ip
-    ip=$(curl -fsSL4 --max-time 4 https://icanhazip.com 2>/dev/null || \
-         curl -fsSL4 --max-time 4 https://ifconfig.me 2>/dev/null || \
-         ip -4 route get 8.8.8.8 2>/dev/null | awk '{print $7; exit}')
+    local ip=""
+    ip=$(curl -fsSL4 --max-time 4 https://icanhazip.com 2>/dev/null)
+    if [[ -z "$ip" ]]; then
+        ip=$(curl -fsSL4 --max-time 4 https://ifconfig.me 2>/dev/null)
+    fi
+    if [[ -z "$ip" ]]; then
+        ip=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '{print $7; exit}')
+    fi
     echo "${ip:-0.0.0.0}"
 }
 
@@ -163,23 +165,26 @@ detect_compatible_asset() {
 
     local asset_url=""
 
-    if [[ "$arch" == "x86_64" || "$arch" == "amd64" ]]; then
-        if [[ "$has_avx2" == "true" ]]; then
-            asset_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("linux.*x64"; "i")) | select(.name | test("old-cpu"; "i") | not) | .browser_download_url' | head -n1)
-        else
-            asset_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("linux.*x64.*old-cpu"; "i")) | .browser_download_url' | head -n1)
-        fi
-        if [[ -z "$asset_url" || "$asset_url" == "null" ]]; then
-            asset_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("linux.*(x64|amd64)"; "i")) | .browser_download_url' | head -n1)
-        fi
-    elif [[ "$arch" == "aarch64" || "$arch" == "arm64" ]]; then
-        if grep -q -E "asimd|crc32" /proc/cpuinfo 2>/dev/null; then
-            asset_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("linux.*arm64"; "i")) | select(.name | test("old-cpu"; "i") | not) | .browser_download_url' | head -n1)
-        fi
-        if [[ -z "$asset_url" || "$asset_url" == "null" ]]; then
-            asset_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("linux.*(arm64|aarch64)"; "i")) | .browser_download_url' | head -n1)
-        fi
-    fi
+    case "$arch" in
+        x86_64|amd64)
+            if [[ "$has_avx2" == "true" ]]; then
+                asset_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("linux.*x64"; "i")) | select(.name | test("old-cpu"; "i") | not) | .browser_download_url' | head -n1)
+            else
+                asset_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("linux.*x64.*old-cpu"; "i")) | .browser_download_url' | head -n1)
+            fi
+            if [[ -z "$asset_url" || "$asset_url" == "null" ]]; then
+                asset_url=$(echo "$release_json" | jq -r '.assets[] | select((.name | test("linux.*x64"; "i")) or (.name | test("linux.*amd64"; "i"))) | .browser_download_url' | head -n1)
+            fi
+            ;;
+        aarch64|arm64)
+            if grep -q -i "asimd" /proc/cpuinfo 2>/dev/null; then
+                asset_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("linux.*arm64"; "i")) | select(.name | test("old-cpu"; "i") | not) | .browser_download_url' | head -n1)
+            fi
+            if [[ -z "$asset_url" || "$asset_url" == "null" ]]; then
+                asset_url=$(echo "$release_json" | jq -r '.assets[] | select((.name | test("linux.*arm64"; "i")) or (.name | test("linux.*aarch64"; "i"))) | .browser_download_url' | head -n1)
+            fi
+            ;;
+    esac
 
     echo "$asset_url"
 }
@@ -204,7 +209,9 @@ check_and_install_core() {
     local latest_tag
     latest_tag=$(echo "$release_json" | jq -r '.tag_name // empty')
     local installed_tag=""
-    [[ -f "$WW_VER_FILE" ]] && installed_tag=$(cat "$WW_VER_FILE")
+    if [[ -f "$WW_VER_FILE" ]]; then
+        installed_tag=$(cat "$WW_VER_FILE")
+    fi
 
     if [[ -x "$WW_BIN" && "$installed_tag" == "$latest_tag" && "$force_update" != "true" ]]; then
         echo -e "${GREEN}[✓] WaterWall Core is installed and on the latest version (${BOLD}${latest_tag}${NC}${GREEN}).${NC}"
@@ -251,7 +258,7 @@ check_and_install_core() {
 
     mv -f "$extracted_bin" "$WW_BIN"
     chmod +x "$WW_BIN"
-    setcap cap_net_admin,cap_net_raw+ep "$WW_BIN" 2>/dev/null || true
+    setcap cap_net_admin,cap_net_raw+ep "$WW_BIN" 2>/dev/null
     echo "$latest_tag" > "$WW_VER_FILE"
     rm -rf "$ACTIVE_TMP_DIR"
     ACTIVE_TMP_DIR=""
@@ -268,7 +275,10 @@ check_and_install_core() {
 generate_core_json() {
     local active_config="$1"
     local workers
-    workers=$(nproc 2>/dev/null || echo 4)
+    workers=$(nproc 2>/dev/null)
+    if [[ -z "$workers" ]]; then
+        workers=4
+    fi
 
     cat > "$WW_CORE_JSON" <<EOF
 {
@@ -314,7 +324,7 @@ EOF
 generate_probe_configs() {
     local this_ip="$1"
     local peer_ip="$2"
-    local role="$3" # "iran" or "kharej"
+    local role="$3"
 
     local iran_ip="$this_ip"
     local kharej_ip="$peer_ip"
@@ -323,7 +333,6 @@ generate_probe_configs() {
         kharej_ip="$this_ip"
     fi
 
-    # Snapshot existing core.json if present for Ctrl+C rollback
     if [[ -f "$WW_CORE_JSON" ]]; then
         BACKUP_CORE_JSON="${WW_DIR}/.core.json.bak"
         cp -f "$WW_CORE_JSON" "$BACKUP_CORE_JSON"
@@ -468,7 +477,7 @@ run_bidirectional_probe_engine() {
     local spin='-\|/'
     local i=0
     while kill -0 "$ACTIVE_WW_PID" 2>/dev/null; do
-        i=$(( (i+1) %4 ))
+        i=$(( (i+1) % 4 ))
         printf "\r${YELLOW}    [WaterWall Core Probing] Running PacketSender/RawSocket/PacketReceiver... %s${NC}" "${spin:$i:1}"
         sleep 0.2
     done
@@ -791,7 +800,7 @@ def test_tcp_udp_and_sync():
     if open_oneway:
         print("\n  [ASYMMETRIC / ONE-WAY PROTOCOLS DETECTED]:")
         for name, pnum, tx_st, rx_st, ww_chain in open_oneway:
-            print(f"  • {name} (Proto {pnum}): TX={tx_st}, RX={rx_st} -> Can be combined in WaterWall asymmetric chains.")
+            print(f"  * {name} (Proto {pnum}): TX={tx_st}, RX={rx_st} -> Can be combined in WaterWall asymmetric chains.")
     print("═" * 98)
 
 test_tcp_udp_and_sync()
@@ -800,9 +809,10 @@ PYEOF
     wait "$ACTIVE_PY_PID" 2>/dev/null
     ACTIVE_PY_PID=""
 
-    # Probe finished normally; clear rollback trackers
     ROLLBACK_FILES=()
-    [[ -n "$BACKUP_CORE_JSON" && -f "$BACKUP_CORE_JSON" ]] && rm -f "$BACKUP_CORE_JSON"
+    if [[ -n "$BACKUP_CORE_JSON" && -f "$BACKUP_CORE_JSON" ]]; then
+        rm -f "$BACKUP_CORE_JSON"
+    fi
     BACKUP_CORE_JSON=""
 }
 
@@ -820,7 +830,10 @@ menu_create_tunnel() {
         echo -e "  ${CYAN}0)${NC} Back to Main Menu"
         echo ""
         read -rp "$(echo -e "${CYAN}Select an option [0]: ${NC}")" choice
-        if is_back "$choice" || [[ -z "$choice" ]]; then
+        if is_back "$choice"; then
+            return 0
+        fi
+        if [[ -z "$choice" ]]; then
             return 0
         fi
     done
@@ -835,10 +848,14 @@ menu_manage_tunnels() {
         local configs=("${WW_DIR}"/*.json)
         local count=0
         for cfg in "${configs[@]}"; do
-            [[ -e "$cfg" ]] || continue
+            if [[ ! -e "$cfg" ]]; then
+                continue
+            fi
             local bname
             bname=$(basename "$cfg")
-            [[ "$bname" == "core.json" ]] && continue
+            if [[ "$bname" == "core.json" ]]; then
+                continue
+            fi
             count=$((count + 1))
             echo -e "  ${GREEN}${count})${NC} ${bname}"
         done
@@ -851,7 +868,10 @@ menu_manage_tunnels() {
         echo -e "  ${CYAN}0)${NC} Back to Main Menu"
         echo ""
         read -rp "$(echo -e "${CYAN}Select a config to inspect or '0' to go back: ${NC}")" sub_choice
-        if is_back "$sub_choice" || [[ -z "$sub_choice" ]]; then
+        if is_back "$sub_choice"; then
+            return 0
+        fi
+        if [[ -z "$sub_choice" ]]; then
             return 0
         fi
     done
@@ -939,16 +959,21 @@ menu_uninstall() {
     echo -e "${BOLD}${RED}>>> Complete Uninstall (Waterwall-Manager + WaterWall Core + All Tunnels)${NC}"
     echo -e "${BLUE}──────────────────────────────────────────────────────────────────────────${NC}"
     echo -e "${YELLOW}This will permanently remove:${NC}"
-    echo -e "  • All running WaterWall processes and systemd tunnel services"
-    echo -e "  • WaterWall Core binary, configs, logs, and probes in ${BOLD}${WW_DIR}${NC}"
-    echo -e "  • The global ${BOLD}wwmng${NC} command at ${BOLD}${WWMNG_BIN}${NC}"
+    echo -e "  * All running WaterWall processes and systemd tunnel services"
+    echo -e "  * WaterWall Core binary, configs, logs, and probes in ${BOLD}${WW_DIR}${NC}"
+    echo -e "  * The global ${BOLD}wwmng${NC} command at ${BOLD}${WWMNG_BIN}${NC}"
     echo ""
     echo -e "  ${RED}yes)${NC} Confirm Complete Uninstall"
     echo -e "  ${CYAN}0)${NC}   Cancel and Go Back"
     echo ""
     read -rp "$(echo -e "${RED}Type 'yes' to wipe everything, or '0' to go back: ${NC}")" confirm
 
-    if is_back "$confirm" || [[ "${confirm,,}" != "yes" ]]; then
+    if is_back "$confirm"; then
+        echo -e "${GREEN}[*] Uninstall cancelled.${NC}"
+        sleep 1
+        return 0
+    fi
+    if [[ "${confirm,,}" != "yes" ]]; then
         echo -e "${GREEN}[*] Uninstall cancelled.${NC}"
         sleep 1
         return 0
@@ -956,18 +981,20 @@ menu_uninstall() {
 
     echo ""
     echo -e "${CYAN}[*] Stopping running WaterWall processes...${NC}"
-    pkill -9 -f "${WW_BIN}" 2>/dev/null || true
+    pkill -9 -f "${WW_BIN}" 2>/dev/null
 
     echo -e "${CYAN}[*] Stopping and removing any Waterwall-Manager / WaterWall systemd services...${NC}"
     for svc in /etc/systemd/system/wwmng*.service /etc/systemd/system/waterwall*.service /etc/systemd/system/astro-tun*.service; do
-        [[ -e "$svc" ]] || continue
+        if [[ ! -e "$svc" ]]; then
+            continue
+        fi
         local svc_name
         svc_name=$(basename "$svc")
-        systemctl stop "$svc_name" 2>/dev/null || true
-        systemctl disable "$svc_name" 2>/dev/null || true
+        systemctl stop "$svc_name" 2>/dev/null
+        systemctl disable "$svc_name" 2>/dev/null
         rm -f "$svc"
     done
-    systemctl daemon-reload 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null
 
     echo -e "${CYAN}[*] Removing installation directories (${WW_DIR} & legacy /opt/astro-tun)...${NC}"
     rm -rf "${WW_DIR}" /opt/astro-tun
@@ -989,7 +1016,9 @@ main_menu() {
     while true; do
         print_banner
         local current_ver="Not Installed"
-        [[ -f "$WW_VER_FILE" ]] && current_ver=$(cat "$WW_VER_FILE")
+        if [[ -f "$WW_VER_FILE" ]]; then
+            current_ver=$(cat "$WW_VER_FILE")
+        fi
 
         echo -e "  Core Binary : ${GREEN}${WW_BIN}${NC}"
         echo -e "  Core Version: ${YELLOW}${current_ver}${NC} ($(uname -m))"
