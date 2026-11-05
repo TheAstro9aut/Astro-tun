@@ -88,16 +88,14 @@ mkdir -p "${WW_DIR}"/{log,libs,configs,results}
 
 print_banner() {
     clear
-    echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}${BOLD}║${NC}  ${BLUE}██╗    ██╗ █████╗ ████████╗███████╗██████╗ ██╗    ██╗ █████╗ ██╗     ██╗${NC}  ${CYAN}${BOLD}║${NC}"
-    echo -e "${CYAN}${BOLD}║${NC}  ${BLUE}██║    ██║██╔══██╗╚══██╔══╝██╔════╝██╔══██╗██║    ██║██╔══██╗██║     ██║${NC}  ${CYAN}${BOLD}║${NC}"
-    echo -e "${CYAN}${BOLD}║${NC}  ${CYAN}██║ █╗ ██║███████║   ██║   █████╗  ██████╔╝██║ █╗ ██║███████║██║     ██║${NC}  ${CYAN}${BOLD}║${NC}"
-    echo -e "${CYAN}${BOLD}║${NC}  ${CYAN}██║███╗██║██╔══██║   ██║   ██╔══╝  ██╔══██╗██║███╗██║██╔══██║██║     ██║${NC}  ${CYAN}${BOLD}║${NC}"
-    echo -e "${CYAN}${BOLD}║${NC}  ${MAGENTA}╚███╔███╔╝██║  ██║   ██║   ███████╗██║  ██║╚███╔███╔╝██║  ██║███████╗███████╗${NC}${CYAN}${BOLD}║${NC}"
-    echo -e "${CYAN}${BOLD}║${NC}  ${MAGENTA} ╚══╝╚══╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝ ╚═╝  ╚═╝╚══════╝╚══════╝${NC}${CYAN}${BOLD}║${NC}"
-    echo -e "${CYAN}${BOLD}║${NC}               ${WHITE}───  W A T E R W A L L - M A N A G E R  ───${NC}                ${CYAN}${BOLD}║${NC}"
-    echo -e "${CYAN}${BOLD}║${NC}            ${YELLOW}Command: wwmng   *   Press Ctrl+C anytime to Rollback${NC}          ${CYAN}${BOLD}║${NC}"
-    echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════════════════════════════╝${NC}"
+    echo -e "  ${CYAN}██╗    ██╗ █████╗ ████████╗███████╗██████╗ ██╗    ██╗ █████╗ ██╗     ██╗${NC}  "
+    echo -e "  ${CYAN}██║    ██║██╔══██╗╚══██╔══╝██╔════╝██╔══██╗██║    ██║██╔══██╗██║     ██║${NC}  "
+    echo -e "  ${CYAN}██║ █╗ ██║███████║   ██║   █████╗  ██████╔╝██║ █╗ ██║███████║██║     ██║${NC}  "
+    echo -e "  ${CYAN}██║███╗██║██╔══██║   ██║   ██╔══╝  ██╔══██╗██║███╗██║██╔══██║██║     ██║${NC}  "
+    echo -e "  ${CYAN}╚███╔███╔╝██║  ██║   ██║   ███████╗██║  ██║╚███╔███╔╝██║  ██║███████╗███████╗${NC}"
+    echo -e "  ${CYAN} ╚══╝╚══╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝ ╚═╝  ╚═╝╚══════╝╚══════╝${NC}"
+    echo -e "               ${WHITE}───  W A T E R W A L L - M A N A G E R  ───${NC}                "
+    echo -e "                            ${YELLOW}${BOLD}Waterwall $(cat "$WW_VER_FILE" 2>/dev/null || echo unknown)${NC}"
 }
 
 is_back() {
@@ -1020,8 +1018,6 @@ main_menu() {
             current_ver=$(cat "$WW_VER_FILE")
         fi
 
-        echo -e "  Core Binary : ${GREEN}${WW_BIN}${NC}"
-        echo -e "  Core Version: ${YELLOW}${current_ver}${NC} ($(uname -m))"
         echo -e "${BLUE}──────────────────────────────────────────────────────────────────────────${NC}"
         echo -e "  ${GREEN}1)${NC} Create a Tunnel"
         echo -e "  ${GREEN}2)${NC} Manage Tunnels"
