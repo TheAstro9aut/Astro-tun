@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -e
 
-REPO_RAW_URL="https://raw.githubusercontent.com/TheAstro9aut/Astro-tun/main"
-INSTALL_DIR="/opt/astro-tun"
-BIN_PATH="/usr/local/bin/astro-tun"
+REPO_RAW_URL="https://raw.githubusercontent.com/TheAstro9aut/Waterwall-Manager/main"
+INSTALL_DIR="/opt/waterwall-manager"
+BIN_PATH="/usr/local/bin/wwmng"
+TMP_DL=""
 
 CYAN='\033[0;36m'
 GREEN='\033[0;32m'
@@ -11,10 +12,20 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
+cleanup_install() {
+    echo -e "\n${RED}[!] Installation interrupted by user (Ctrl+C). Rolling back...${NC}"
+    [[ -n "$TMP_DL" && -f "$TMP_DL" ]] && rm -f "$TMP_DL"
+    exit 130
+}
+trap cleanup_install INT TERM
+
 if [[ $EUID -ne 0 ]]; then
     echo -e "${RED}[!] Please run the installer as root (sudo -i).${NC}"
     exit 1
 fi
+
+# Clean up legacy astro-tun binary if present
+rm -f /usr/local/bin/astro-tun 2>/dev/null || true
 
 echo -e "${CYAN}[*] Installing required system packages...${NC}"
 if command -v apt-get &>/dev/null; then
@@ -28,15 +39,17 @@ fi
 
 mkdir -p "$INSTALL_DIR"/{log,libs,configs,results}
 
-echo -e "${CYAN}[*] Downloading Astro Tun wizard...${NC}"
-if [[ -f "./astro-tun.sh" ]]; then
-    cp "./astro-tun.sh" "$BIN_PATH"
+echo -e "${CYAN}[*] Downloading Waterwall-Manager (wwmng)...${NC}"
+TMP_DL=$(mktemp)
+if [[ -f "./wwmng.sh" ]]; then
+    cp "./wwmng.sh" "$BIN_PATH"
 else
-    curl -fsSL "$REPO_RAW_URL/astro-tun.sh" -o "$BIN_PATH"
+    curl -fsSL "$REPO_RAW_URL/wwmng.sh" -o "$TMP_DL"
+    mv -f "$TMP_DL" "$BIN_PATH"
 fi
 
 chmod +x "$BIN_PATH"
 
-echo -e "${GREEN}[✓] Astro Tun installed successfully! Run it anytime by typing: astro-tun${NC}"
+echo -e "${GREEN}[✓] Waterwall-Manager installed! Run it anytime by typing: wwmng${NC}"
 sleep 1
 exec "$BIN_PATH"
