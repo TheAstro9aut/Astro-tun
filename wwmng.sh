@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 
 # ==============================================================================
-# ASTRO TUN - WaterWall Tunneling & Packet Probing Wizard
-# Repository: https://github.com/TheAstro9aut/Astro-tun
+# WATERWALL-MANAGER (wwmng) - Tunneling & Bidirectional Packet Probe Wizard
+# Repository: https://github.com/TheAstro9aut/Waterwall-Manager
 # WaterWall:  https://github.com/radkesvat/WaterWall
 # ==============================================================================
 
-WW_DIR="/opt/astro-tun"
+WW_DIR="/opt/waterwall-manager"
 WW_BIN="${WW_DIR}/Waterwall"
 WW_VER_FILE="${WW_DIR}/.version"
 WW_CORE_JSON="${WW_DIR}/core.json"
-ASTROTUN_BIN="/usr/local/bin/astro-tun"
+WWMNG_BIN="/usr/local/bin/wwmng"
 WW_REPO="radkesvat/WaterWall"
 WW_API_LATEST="https://api.github.com/repos/${WW_REPO}/releases/latest"
 
@@ -21,36 +21,93 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 MAGENTA='\033[0;35m'
 CYAN='\033[0;36m'
+WHITE='\033[1;37m'
 BOLD='\033[1m'
 NC='\033[0m'
 
+# State tracking for Ctrl+C rollback
+ACTIVE_TMP_DIR=""
+ACTIVE_WW_PID=""
+ACTIVE_PY_PID=""
+ROLLBACK_FILES=()
+BACKUP_CORE_JSON=""
+
+# ==============================================================================
+# CTRL+C (SIGINT / SIGTERM) ROLLBACK & CLEANUP HANDLER
+# ==============================================================================
+
+handle_interrupt() {
+    trap '' INT TERM
+    echo -e "\n\n${RED}${BOLD}[!] Ctrl+C detected! Cancelling active operations and rolling back...${NC}"
+
+    # 1. Kill any running WaterWall or probe child processes spawned by this session
+    if [[ -n "$ACTIVE_WW_PID" ]] && kill -0 "$ACTIVE_WW_PID" 2>/dev/null; then
+        echo -e "${YELLOW}    -> Stopping active WaterWall process (PID: ${ACTIVE_WW_PID})...${NC}"
+        kill -9 "$ACTIVE_WW_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$ACTIVE_PY_PID" ]] && kill -0 "$ACTIVE_PY_PID" 2>/dev/null; then
+        echo -e "${YELLOW}    -> Stopping active Packet Probe engine (PID: ${ACTIVE_PY_PID})...${NC}"
+        kill -9 "$ACTIVE_PY_PID" 2>/dev/null || true
+    fi
+    pkill -9 -f "${WW_BIN}" 2>/dev/null || true
+
+    # 2. Remove temporary download/extraction directories
+    if [[ -n "$ACTIVE_TMP_DIR" && -d "$ACTIVE_TMP_DIR" ]]; then
+        echo -e "${YELLOW}    -> Removing temporary directory (${ACTIVE_TMP_DIR})...${NC}"
+        rm -rf "$ACTIVE_TMP_DIR"
+    fi
+
+    # 3. Roll back uncommitted/interrupted files created during the current step
+    if [[ ${#ROLLBACK_FILES[@]} -gt 0 ]]; then
+        for f in "${ROLLBACK_FILES[@]}"; do
+            if [[ -e "$f" ]]; then
+                echo -e "${YELLOW}    -> Rolling back file: ${f}${NC}"
+                rm -f "$f"
+            fi
+        done
+    fi
+
+    # 4. Restore previous core.json backup if one was snapshotted
+    if [[ -n "$BACKUP_CORE_JSON" && -f "$BACKUP_CORE_JSON" ]]; then
+        mv -f "$BACKUP_CORE_JSON" "$WW_CORE_JSON"
+        echo -e "${YELLOW}    -> Restored previous core.json configuration.${NC}"
+    fi
+
+    echo -e "${GREEN}[✓] Rollback complete. Exiting Waterwall-Manager.${NC}"
+    exit 130
+}
+
+trap handle_interrupt INT TERM
+
 # Ensure root privileges
 if [[ $EUID -ne 0 ]]; then
-    echo -e "${RED}[!] Astro Tun must be run as root (needed for RawSocket & TUN capabilities).${NC}"
+    echo -e "${RED}[!] Waterwall-Manager (wwmng) must be run as root (needed for RawSocket & TUN capabilities).${NC}"
     exit 1
 fi
 
 mkdir -p "${WW_DIR}"/{log,libs,configs,results}
 
 # ==============================================================================
-# HELPER FUNCTIONS & NAVIGATION
+# UI BANNER & NAVIGATION HELPERS
 # ==============================================================================
 
 print_banner() {
     clear
-    echo -e "${CYAN}${BOLD}"
-    echo "    ___         __               ______            "
-    echo "   /   |  _____/ /________      /_  __/_  ______   "
-    echo "  / /| | / ___/ __/ ___/ __ \    / / / / / / __ \  "
-    echo " / ___ |(__  ) /_/ /  / /_/ /   / / / /_/ / / / /  "
-    echo "/_/  |_/____/\__/_/   \____/   /_/  \__,_/_/ /_/   "
-    echo -e "${NC}${MAGENTA}   WaterWall Core Management & Packet Probe Wizard${NC}"
-    echo -e "${BLUE}══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}${BOLD}║${NC}${BLUE}██╗    ██╗ █████╗ ████████╗███████╗██████╗ ██╗    ██╗ █████╗ ██╗     ██╗${NC}${CYAN}${BOLD}║${NC}"
+    echo -e "${CYAN}${BOLD}║${NC}${BLUE}██║    ██║██╔══██╗╚══██╔══╝██╔════╝██╔══██╗██║    ██║██╔══██╗██║     ██║${NC}${CYAN}${BOLD}║${NC}"
+    echo -e "${CYAN}${BOLD}║${NC}${CYAN}██║ █╗ ██║███████║   ██║   █████╗  ██████╔╝██║ █╗ ██║███████║██║     ██║${NC}${CYAN}${BOLD}║${NC}"
+    echo -e "${CYAN}${BOLD}║${NC}${CYAN}██║███╗██║██╔══██║   ██║   ██╔══╝  ██╔══██╗██║███╗██║██╔══██║██║     ██║${NC}${CYAN}${BOLD}║${NC}"
+    echo -e "${CYAN}${BOLD}║${NC}${MAGENTA}╚███╔███╔╝██║  ██║   ██║   ███████╗██║  ██║╚███╔███╔╝██║  ██║███████╗███████╗${NC}${CYAN}${BOLD}║${NC}"
+    echo -e "${CYAN}${BOLD}║${NC}${MAGENTA} ╚══╝╚══╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝ ╚═╝  ╚═╝╚══════╝╚══════╝${NC}${CYAN}${BOLD}║${NC}"
+    echo -e "${CYAN}${BOLD}║${NC}${WHITE}───  W A T E R W A L L - M A N A G E R  ───${NC}${CYAN}${BOLD}║${NC}"
+    echo -e "${CYAN}${BOLD}║${NC}${YELLOW}Command: wwmng  │  Press Ctrl+C anytime to Rollback${NC}${CYAN}${BOLD}║${NC}"
+    echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════════════════════════════╝${NC}"
 }
 
 is_back() {
     local input="${1,,}"
-    [[ "$input" == "0" || "$input" == "b" || "$input" == "back" ]]
+    [[ "$input" == "0" || "$input" == "b" \vert{}\vert{} "$input" == "back" ]]
 }
 
 prompt_input() {
@@ -60,20 +117,20 @@ prompt_input() {
     local user_input=""
 
     if [[ -n "$default_val" ]]; then
-        read -rp "$(echo -e "${CYAN}${prompt_text} [${GREEN}${default_val}${CYAN}] (or '0' to go back): ${NC}")" user_input
+        read -rp "$(echo -e "${CYAN}${prompt_text} [${GREEN}${default_val}${CYAN}] (or '0' to go back):${NC}")" user_input
         if is_back "$user_input"; then
             return 1
         fi
         user_input="${user_input:-$default_val}"
     else
         while [[ -z "$user_input" ]]; do
-            read -rp "$(echo -e "${CYAN}${prompt_text} (or '0' to go back): ${NC}")" user_input
+            read -rp "$(echo -e "${CYAN}${prompt_text} (or '0' to go back):${NC}")" user_input
             if is_back "$user_input"; then
                 return 1
             fi
         done
     fi
-    printf -v "$var_name" '%s' "$user_input"
+    printf -v "$var_name" '\%s' "$user_input"
     return 0
 }
 
@@ -88,10 +145,6 @@ get_public_ip() {
          curl -fsSL4 --max-time 4 https://ifconfig.me 2>/dev/null || \
          ip -4 route get 8.8.8.8 2>/dev/null | awk '{print $7; exit}')
     echo "${ip:-0.0.0.0}"
-}
-
-get_default_iface() {
-    ip -4 route show default 2>/dev/null | awk '{print $5; exit}'
 }
 
 # ==============================================================================
@@ -110,20 +163,20 @@ detect_compatible_asset() {
 
     local asset_url=""
 
-    if [[ "$arch" == "x86_64" || "$arch" == "amd64" ]]; then
+    if [[ "$arch" == "x86_64" \vert{}\vert{} "$arch" == "amd64" ]]; then
         if [[ "$has_avx2" == "true" ]]; then
             asset_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("linux.*x64"; "i")) | select(.name | test("old-cpu"; "i") | not) | .browser_download_url' | head -n1)
         else
             asset_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("linux.*x64.*old-cpu"; "i")) | .browser_download_url' | head -n1)
         fi
-        if [[ -z "$asset_url" || "$asset_url" == "null" ]]; then
+        if [[ -z "$asset_url" \vert{}\vert{} "$asset_url" == "null" ]]; then
             asset_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("linux.*(x64|amd64)"; "i")) | .browser_download_url' | head -n1)
         fi
-    elif [[ "$arch" == "aarch64" || "$arch" == "arm64" ]]; then
+    elif [[ "$arch" == "aarch64" \vert{}\vert{} "$arch" == "arm64" ]]; then
         if grep -q -E "asimd|crc32" /proc/cpuinfo 2>/dev/null; then
             asset_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("linux.*arm64"; "i")) | select(.name | test("old-cpu"; "i") | not) | .browser_download_url' | head -n1)
         fi
-        if [[ -z "$asset_url" || "$asset_url" == "null" ]]; then
+        if [[ -z "$asset_url" \vert{}\vert{} "$asset_url" == "null" ]]; then
             asset_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("linux.*(arm64|aarch64)"; "i")) | .browser_download_url' | head -n1)
         fi
     fi
@@ -168,30 +221,31 @@ check_and_install_core() {
     local asset_url
     asset_url=$(detect_compatible_asset "$release_json")
 
-    if [[ -z "$asset_url" || "$asset_url" == "null" ]]; then
-        echo -e "${RED}[!] No compatible Linux binary found for architecture $(uname -m) in release ${latest_tag}.${NC}"
+    if [[ -z "$asset_url" \vert{}\vert{} "$asset_url" == "null" ]]; then
+        echo -e "${RED}[!] No compatible Linux binary found for architecture$(uname -m) in release ${latest_tag}.${NC}"
         return 1
     fi
 
     local asset_filename
     asset_filename=$(basename "$asset_url")
-    echo -e "${CYAN}[*] Selected compatible build: ${BOLD}${asset_filename}${NC}"
+    echo -e "${CYAN}[*] Selected compatible build:${BOLD}${asset_filename}${NC}"
 
-    local tmp_dir
-    tmp_dir=$(mktemp -d)
-    if ! curl -fL --progress-bar "$asset_url" -o "${tmp_dir}/waterwall.zip"; then
+    ACTIVE_TMP_DIR=$(mktemp -d)
+    if ! curl -fL --progress-bar "$asset_url" -o "${ACTIVE_TMP_DIR}/waterwall.zip"; then
         echo -e "${RED}[!] Download failed.${NC}"
-        rm -rf "$tmp_dir"
+        rm -rf "$ACTIVE_TMP_DIR"
+        ACTIVE_TMP_DIR=""
         return 1
     fi
 
-    unzip -qo "${tmp_dir}/waterwall.zip" -d "$tmp_dir"
+    unzip -qo "${ACTIVE_TMP_DIR}/waterwall.zip" -d "$ACTIVE_TMP_DIR"
     local extracted_bin
-    extracted_bin=$(find "$tmp_dir" -maxdepth 2 -type f -iname "waterwall*" ! -name "*.zip" ! -name "*.json" ! -name "*.md" | head -n1)
+    extracted_bin=$(find "$ACTIVE_TMP_DIR" -maxdepth 2 -type f -iname "waterwall*" ! -name "*.zip" ! -name "*.json" ! -name "*.md" | head -n1)
 
     if [[ -z "$extracted_bin" ]]; then
         echo -e "${RED}[!] Could not locate Waterwall executable inside the archive.${NC}"
-        rm -rf "$tmp_dir"
+        rm -rf "$ACTIVE_TMP_DIR"
+        ACTIVE_TMP_DIR=""
         return 1
     fi
 
@@ -199,7 +253,8 @@ check_and_install_core() {
     chmod +x "$WW_BIN"
     setcap cap_net_admin,cap_net_raw+ep "$WW_BIN" 2>/dev/null || true
     echo "$latest_tag" > "$WW_VER_FILE"
-    rm -rf "$tmp_dir"
+    rm -rf "$ACTIVE_TMP_DIR"
+    ACTIVE_TMP_DIR=""
 
     echo -e "${GREEN}[✓] WaterWall Core (${latest_tag}) installed and given execution permissions at ${WW_BIN}.${NC}"
     sleep 1
@@ -268,9 +323,21 @@ generate_probe_configs() {
         kharej_ip="$this_ip"
     fi
 
+    # Snapshot existing core.json if present for Ctrl+C rollback
+    if [[ -f "$WW_CORE_JSON" ]]; then
+        BACKUP_CORE_JSON="${WW_DIR}/.core.json.bak"
+        cp -f "$WW_CORE_JSON" "$BACKUP_CORE_JSON"
+    fi
+
+    ROLLBACK_FILES=(
+        "${WW_DIR}/config_probe_iran.json"
+        "${WW_DIR}/config_probe_kharej.json"
+        "${WW_DIR}/core.json"
+    )
+
     cat > "${WW_DIR}/config_probe_iran.json" <<EOF
 {
-  "name": "astro-packet-probe-iran",
+  "name": "wwmng-packet-probe-iran",
   "nodes": [
     {
       "name": "probe-sender",
@@ -321,7 +388,7 @@ EOF
 
     cat > "${WW_DIR}/config_probe_kharej.json" <<EOF
 {
-  "name": "astro-packet-probe-kharej",
+  "name": "wwmng-packet-probe-kharej",
   "nodes": [
     {
       "name": "probe-sender",
@@ -396,21 +463,22 @@ run_bidirectional_probe_engine() {
         cd "$WW_DIR" || exit
         timeout 6 "$WW_BIN" > "${WW_DIR}/log/stdout.log" 2>&1
     ) &
-    local ww_pid=$!
+    ACTIVE_WW_PID=$!
 
     local spin='-\|/'
     local i=0
-    while kill -0 "$ww_pid" 2>/dev/null; do
+    while kill -0 "$ACTIVE_WW_PID" 2>/dev/null; do
         i=$(( (i+1) %4 ))
         printf "\r${YELLOW}    [WaterWall Core Probing] Running PacketSender/RawSocket/PacketReceiver... %s${NC}" "${spin:$i:1}"
         sleep 0.2
     done
+    ACTIVE_WW_PID=""
     printf "\r${GREEN}[✓] WaterWall Core native probe cycle completed.                                  ${NC}\n"
 
     echo -e "${CYAN}[*] Step 2/3: Running Bidirectional Raw IP Protocol & Speed Benchmark (Both Ways)...${NC}"
     echo -e "${YELLOW}    Make sure Packet Tester is also running on Peer (${peer_ip}) with the matching port (${sync_port}).${NC}"
 
-    python3 - "$this_ip" "$peer_ip" "$role" "$sync_port" "${WW_DIR}/log/core.log" << 'PYEOF'
+    python3 - "$this_ip" "$peer_ip" "$role" "$sync_port" "${WW_DIR}/log/core.log" << 'PYEOF' &
 import sys, socket, struct, time, json, select, os
 
 this_ip = sys.argv[1]
@@ -434,7 +502,7 @@ PROTOCOLS = [
     ("UDPLite",    136, "TunDevice -> IpManipulator (Proto 136) -> RawSocket"),
 ]
 
-MAGIC = b"ASTROTUN_PROBE_V1"
+MAGIC = b"WWMNG_PROBE_V1"
 
 def send_raw_probes(target_ip):
     for name, proto_num, _ in PROTOCOLS:
@@ -728,221 +796,6 @@ def test_tcp_udp_and_sync():
 
 test_tcp_udp_and_sync()
 PYEOF
-}
-
-# ==============================================================================
-# MENU ACTIONS
-# ==============================================================================
-
-menu_create_tunnel() {
-    while true; do
-        print_banner
-        echo -e "${BOLD}${MAGENTA}>>> Create a Tunnel${NC}"
-        echo -e "${BLUE}──────────────────────────────────────────────────────────────${NC}"
-        echo -e "${YELLOW}[i] Tunnel creation wizard placeholder (to be configured in the next step).${NC}"
-        echo ""
-        echo -e "  ${CYAN}0)${NC} Back to Main Menu"
-        echo ""
-        read -rp "$(echo -e "${CYAN}Select an option [0]: ${NC}")" choice
-        if is_back "$choice" || [[ -z "$choice" ]]; then
-            return 0
-        fi
-    done
-}
-
-menu_manage_tunnels() {
-    while true; do
-        print_banner
-        echo -e "${BOLD}${MAGENTA}>>> Manage Tunnels${NC}"
-        echo -e "${BLUE}──────────────────────────────────────────────────────────────${NC}"
-
-        local configs=("${WW_DIR}"/*.json)
-        local count=0
-        for cfg in "${configs[@]}"; do
-            [[ -e "$cfg" ]] || continue
-            local bname
-            bname=$(basename "$cfg")
-            [[ "$bname" == "core.json" ]] && continue
-            count=$((count + 1))
-            echo -e "  ${GREEN}${count})${NC} ${bname}"
-        done
-
-        if [[ $count -eq 0 ]]; then
-            echo -e "  ${YELLOW}No active tunnel profiles found in ${WW_DIR}.${NC}"
-        fi
-
-        echo ""
-        echo -e "  ${CYAN}0)${NC} Back to Main Menu"
-        echo ""
-        read -rp "$(echo -e "${CYAN}Select a config to inspect or '0' to go back: ${NC}")" sub_choice
-        if is_back "$sub_choice" || [[ -z "$sub_choice" ]]; then
-            return 0
-        fi
-    done
-}
-
-menu_packet_tester() {
-    while true; do
-        print_banner
-        echo -e "${BOLD}${MAGENTA}>>> WaterWall Packet Tester & Bidirectional Protocol Probe${NC}"
-        echo -e "${BLUE}──────────────────────────────────────────────────────────────${NC}"
-        echo -e "Select this server's role for the probe:"
-        echo -e "  ${GREEN}1)${NC} Iran / Initiator Node  (Generates & runs ${BOLD}config_probe_iran.json${NC})"
-        echo -e "  ${GREEN}2)${NC} Kharej / Responder Node (Generates & runs ${BOLD}config_probe_kharej.json${NC})"
-        echo -e "  ${CYAN}0)${NC} Back to Main Menu"
-        echo ""
-        read -rp "$(echo -e "${CYAN}Select role [0-2]: ${NC}")" role_choice
-
-        if is_back "$role_choice"; then
-            return 0
-        fi
-
-        local role_name=""
-        case "$role_choice" in
-            1) role_name="iran" ;;
-            2) role_name="kharej" ;;
-            *)
-                echo -e "${RED}[!] Invalid option.${NC}"
-                sleep 1
-                continue
-                ;;
-        esac
-
-        local detected_ip
-        detected_ip=$(get_public_ip)
-        local this_ip=""
-        local peer_ip=""
-        local sync_port=""
-
-        echo ""
-        if ! prompt_input "Enter THIS server's Public IP" "$detected_ip" this_ip; then
-            continue
-        fi
-
-        if ! prompt_input "Enter PEER server's Public IP" "" peer_ip; then
-            continue
-        fi
-
-        if ! prompt_input "Enter Coordination Port for Bidirectional Speed Test" "54321" sync_port; then
-            continue
-        fi
-
-        echo ""
-        echo -e "${CYAN}[*] Generating WaterWall configuration files in ${WW_DIR}...${NC}"
-        generate_probe_configs "$this_ip" "$peer_ip" "$role_name"
-        echo -e "${GREEN}[✓] Created: ${WW_DIR}/core.json${NC}"
-        echo -e "${GREEN}[✓] Created: ${WW_DIR}/config_probe_iran.json${NC}"
-        echo -e "${GREEN}[✓] Created: ${WW_DIR}/config_probe_kharej.json${NC}"
-
-        run_bidirectional_probe_engine "$this_ip" "$peer_ip" "$role_name" "$sync_port"
-
-        pause_back
-        return 0
-    done
-}
-
-menu_update_core() {
-    print_banner
-    echo -e "${BOLD}${MAGENTA}>>> Update WaterWall Core${NC}"
-    echo -e "${BLUE}──────────────────────────────────────────────────────────────${NC}"
-    echo -e "  ${GREEN}1)${NC} Check & Force Re-install Latest WaterWall Core"
-    echo -e "  ${CYAN}0)${NC} Back to Main Menu"
-    echo ""
-    read -rp "$(echo -e "${CYAN}Select an option [0-1]: ${NC}")" up_choice
-    if is_back "$up_choice"; then
-        return 0
-    fi
-    if [[ "$up_choice" == "1" ]]; then
-        check_and_install_core "true"
-        pause_back
-    fi
-}
-
-menu_uninstall() {
-    print_banner
-    echo -e "${BOLD}${RED}>>> Complete Uninstall (Astro Tun + WaterWall Core + All Tunnels)${NC}"
-    echo -e "${BLUE}──────────────────────────────────────────────────────────────${NC}"
-    echo -e "${YELLOW}This will permanently remove:${NC}"
-    echo -e "  • All running WaterWall processes and systemd tunnel services"
-    echo -e "  • WaterWall Core binary, configs, logs, and probes in ${BOLD}${WW_DIR}${NC}"
-    echo -e "  • The global ${BOLD}astro-tun${NC} command at ${BOLD}${ASTROTUN_BIN}${NC}"
-    echo ""
-    echo -e "  ${RED}yes)${NC} Confirm Complete Uninstall"
-    echo -e "  ${CYAN}0)${NC}   Cancel and Go Back"
-    echo ""
-    read -rp "$(echo -e "${RED}Type 'yes' to wipe everything, or '0' to go back: ${NC}")" confirm
-
-    if is_back "$confirm" || [[ "${confirm,,}" != "yes" ]]; then
-        echo -e "${GREEN}[*] Uninstall cancelled.${NC}"
-        sleep 1
-        return 0
-    fi
-
-    echo ""
-    echo -e "${CYAN}[*] Stopping running WaterWall processes...${NC}"
-    pkill -9 -f "${WW_BIN}" 2>/dev/null || true
-
-    echo -e "${CYAN}[*] Stopping and removing any Astro Tun / WaterWall systemd services...${NC}"
-    for svc in /etc/systemd/system/astro-tun*.service /etc/systemd/system/waterwall*.service; do
-        [[ -e "$svc" ]] || continue
-        local svc_name
-        svc_name=$(basename "$svc")
-        systemctl stop "$svc_name" 2>/dev/null || true
-        systemctl disable "$svc_name" 2>/dev/null || true
-        rm -f "$svc"
-    done
-    systemctl daemon-reload 2>/dev/null || true
-
-    echo -e "${CYAN}[*] Removing installation directory (${WW_DIR})...${NC}"
-    rm -rf "${WW_DIR}"
-
-    echo -e "${CYAN}[*] Removing astro-tun binary (${ASTROTUN_BIN})...${NC}"
-    rm -f "${ASTROTUN_BIN}"
-
-    echo -e "${GREEN}[✓] Astro Tun, WaterWall Core, tunnels, and all configs have been completely removed.${NC}"
-    exit 0
-}
-
-# ==============================================================================
-# MAIN ENTRYPOINT
-# ==============================================================================
-
-main_menu() {
-    check_and_install_core "false"
-
-    while true; do
-        print_banner
-        local current_ver="Not Installed"
-        [[ -f "$WW_VER_FILE" ]] && current_ver=$(cat "$WW_VER_FILE")
-
-        echo -e "  Core Binary : ${GREEN}${WW_BIN}${NC}"
-        echo -e "  Core Version: ${YELLOW}${current_ver}${NC} ($(uname -m))"
-        echo -e "${BLUE}──────────────────────────────────────────────────────────────${NC}"
-        echo -e "  ${GREEN}1)${NC} Create a Tunnel"
-        echo -e "  ${GREEN}2)${NC} Manage Tunnels"
-        echo -e "  ${GREEN}3)${NC} Packet Tester (Bidirectional Probe & Speed Test)"
-        echo -e "  ${GREEN}4)${NC} Update Core"
-        echo -e "  ${RED}5)${NC} Uninstall Astro Tun (Wipe Everything)"
-        echo -e "  ${CYAN}0)${NC} Exit"
-        echo -e "${BLUE}──────────────────────────────────────────────────────────────${NC}"
-        read -rp "$(echo -e "${CYAN}Select an option [0-5]: ${NC}")" main_choice
-
-        case "${main_choice,,}" in
-            1) menu_create_tunnel ;;
-            2) menu_manage_tunnels ;;
-            3) menu_packet_tester ;;
-            4) menu_update_core ;;
-            5) menu_uninstall ;;
-            0|e|exit|q|quit|b|back)
-                echo -e "${GREEN}Exiting Astro Tun. Goodbye!${NC}"
-                exit 0
-                ;;
-            *)
-                echo -e "${RED}[!] Invalid selection. Please choose 0-5.${NC}"
-                sleep 1
-                ;;
-        esac
-    done
-}
-
-main_menu
+    ACTIVE_PY_PID=$!
+    wait "$ACTIVE_PY_PID" 2>/dev/null
+    ACTIVE
