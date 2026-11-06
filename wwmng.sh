@@ -29,8 +29,6 @@ NC='\033[0m'
 ACTIVE_TMP_DIR=""
 ACTIVE_WW_PID=""
 ACTIVE_PY_PID=""
-ROLLBACK_FILES=()
-BACKUP_CORE_JSON=""
 
 # ==============================================================================
 # CTRL+C (SIGINT / SIGTERM) ROLLBACK & CLEANUP HANDLER
@@ -40,37 +38,48 @@ handle_interrupt() {
     trap '' INT TERM
     echo -e "\n\n${RED}${BOLD}[!] Ctrl+C detected! Cancelling active operations and rolling back...${NC}"
 
+    # The packet tester (python) owns its WaterWall children: ask it to stop them
+    # gracefully so WaterWall removes the iptables rules it installed.
+    if [[ -n "$ACTIVE_PY_PID" ]] && kill -0 "$ACTIVE_PY_PID" 2>/dev/null; then
+        echo -e "${YELLOW}    -> Stopping Packet Tester and its WaterWall processes (PID: ${ACTIVE_PY_PID})...${NC}"
+        kill -TERM "$ACTIVE_PY_PID" 2>/dev/null
+        local waited=0
+        while kill -0 "$ACTIVE_PY_PID" 2>/dev/null && [[ $waited -lt 40 ]]; do
+            sleep 0.5
+            waited=$((waited + 1))
+        done
+        if kill -0 "$ACTIVE_PY_PID" 2>/dev/null; then
+            kill -9 "$ACTIVE_PY_PID" 2>/dev/null
+            purge_ww_rules
+        fi
+    fi
+
+    # Only a core process started by this session is ever stopped here, so tunnels
+    # that are already running as services are never touched.
     if [[ -n "$ACTIVE_WW_PID" ]] && kill -0 "$ACTIVE_WW_PID" 2>/dev/null; then
         echo -e "${YELLOW}    -> Stopping active WaterWall process (PID: ${ACTIVE_WW_PID})...${NC}"
+        kill -TERM "$ACTIVE_WW_PID" 2>/dev/null
+        sleep 2
         kill -9 "$ACTIVE_WW_PID" 2>/dev/null
     fi
-    if [[ -n "$ACTIVE_PY_PID" ]] && kill -0 "$ACTIVE_PY_PID" 2>/dev/null; then
-        echo -e "${YELLOW}    -> Stopping active Packet Probe engine (PID: ${ACTIVE_PY_PID})...${NC}"
-        kill -9 "$ACTIVE_PY_PID" 2>/dev/null
-    fi
-    pkill -9 -f "${WW_BIN}" 2>/dev/null
 
     if [[ -n "$ACTIVE_TMP_DIR" && -d "$ACTIVE_TMP_DIR" ]]; then
         echo -e "${YELLOW}    -> Removing temporary directory (${ACTIVE_TMP_DIR})...${NC}"
         rm -rf "$ACTIVE_TMP_DIR"
     fi
 
-    if [[ ${#ROLLBACK_FILES[@]} -gt 0 ]]; then
-        for f in "${ROLLBACK_FILES[@]}"; do
-            if [[ -e "$f" ]]; then
-                echo -e "${YELLOW}    -> Rolling back file: ${f}${NC}"
-                rm -f "$f"
-            fi
-        done
-    fi
-
-    if [[ -n "$BACKUP_CORE_JSON" && -f "$BACKUP_CORE_JSON" ]]; then
-        mv -f "$BACKUP_CORE_JSON" "$WW_CORE_JSON"
-        echo -e "${YELLOW}    -> Restored previous core.json configuration.${NC}"
-    fi
-
     echo -e "${GREEN}[✓] Rollback complete. Exiting Waterwall-Manager.${NC}"
     exit 130
+}
+
+# Remove only the firewall rules WaterWall's RawSocket tags with its own comments.
+purge_ww_rules() {
+    command -v iptables-save >/dev/null 2>&1 || return 0
+    local rule
+    while IFS= read -r rule; do
+        [[ "$rule" == -A* ]] || continue
+        eval "iptables -t raw ${rule/-A/-D}" 2>/dev/null
+    done < <(iptables-save -t raw 2>/dev/null | grep -E 'WW(RAW|CAP)_NOTRACK')
 }
 
 trap handle_interrupt INT TERM
@@ -165,13 +174,23 @@ detect_compatible_asset() {
 
     case "$arch" in
         x86_64|amd64)
-            if [[ "$has_avx2" == "true" ]]; then
-                asset_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("linux.*x64"; "i")) | select(.name | test("old-cpu"; "i") | not) | .browser_download_url' | head -n1)
-            else
-                asset_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("linux.*x64.*old-cpu"; "i")) | .browser_download_url' | head -n1)
+            # Release has linux builds: clang-avx512f-x64, clang-x64, gcc-x64 and gcc-x64-old-cpu.
+            # Never pick the AVX-512 build unless this CPU really has avx512f (it would crash).
+            if grep -q -i "avx512f" /proc/cpuinfo 2>/dev/null; then
+                asset_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("linux.*avx512f.*x64"; "i")) | .browser_download_url' | head -n1)
             fi
             if [[ -z "$asset_url" || "$asset_url" == "null" ]]; then
-                asset_url=$(echo "$release_json" | jq -r '.assets[] | select((.name | test("linux.*x64"; "i")) or (.name | test("linux.*amd64"; "i"))) | .browser_download_url' | head -n1)
+                if [[ "$has_avx2" == "true" ]]; then
+                    asset_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("linux-gcc-x64"; "i")) | select(.name | test("old-cpu"; "i") | not) | .browser_download_url' | head -n1)
+                    if [[ -z "$asset_url" || "$asset_url" == "null" ]]; then
+                        asset_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("linux.*x64"; "i")) | select(.name | test("old-cpu|avx512"; "i") | not) | .browser_download_url' | head -n1)
+                    fi
+                else
+                    asset_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("linux.*x64.*old-cpu"; "i")) | .browser_download_url' | head -n1)
+                fi
+            fi
+            if [[ -z "$asset_url" || "$asset_url" == "null" ]]; then
+                asset_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("linux.*x64"; "i")) | select(.name | test("avx512"; "i") | not) | .browser_download_url' | head -n1)
             fi
             ;;
         aarch64|arm64)
@@ -267,551 +286,652 @@ check_and_install_core() {
 }
 
 # ==============================================================================
-# WATERWALL CONFIG GENERATORS (core.json & config_probe_*.json)
+# PACKET TESTER (WaterWall PacketGenerator -> RawSocket / RawSocket -> PacketCounter)
 # ==============================================================================
+# The tester is a small python orchestrator that:
+#   * writes core.json + config_probe_tx.json + config_probe_rx.json under ${WW_DIR}/probe/
+#   * starts the real WaterWall core on both servers (receiver first, then sender)
+#   * sends one probe packet burst for every IP protocol number 0-254 in BOTH directions
+#   * reads WaterWall's own PacketCounter report on each side and merges them
+# Your main core.json is never touched.
 
-generate_core_json() {
-    local active_config="$1"
-    local workers
-    workers=$(nproc 2>/dev/null)
-    if [[ -z "$workers" ]]; then
-        workers=4
-    fi
+PROBE_PY="${WW_DIR}/wwprobe.py"
+PROBE_DIR="${WW_DIR}/probe"
 
-    cat > "$WW_CORE_JSON" <<EOF
-{
-  "log": {
-    "path": "log/",
-    "core": {
-      "loglevel": "DEBUG",
-      "file": "core.log",
-      "console": true
-    },
-    "network": {
-      "loglevel": "DEBUG",
-      "file": "network.log",
-      "console": true
-    },
-    "dns": {
-      "loglevel": "SILENT",
-      "file": "dns.log",
-      "console": false
+write_probe_script() {
+    cat > "$PROBE_PY" << 'PYEOF'
+import sys, os, socket, json, time, signal, subprocess, shutil, re, shlex
+
+THIS_IP, PEER_IP, ROLE, SYNC_PORT, WW_BIN, PROBE_DIR, MODE = sys.argv[1:8]
+SYNC_PORT = int(SYNC_PORT)
+IS_SERVER = (ROLE == "kharej")
+DEST_PORT = SYNC_PORT + 13 if SYNC_PORT + 13 < 65535 else SYNC_PORT - 13
+TERM_MARK = b"\x00\x00WWEND\x00\x00"
+
+G, Y, R_, C, B, N = "\033[0;32m", "\033[1;33m", "\033[0;31m", "\033[0;36m", "\033[1m", "\033[0m"
+
+PROTO_NAMES = {
+    1: "ICMP", 2: "IGMP", 4: "IPIP", 6: "TCP", 17: "UDP", 41: "IPv6-Encap",
+    47: "GRE", 50: "ESP", 51: "AH", 89: "OSPF", 115: "L2TP", 132: "SCTP",
+    136: "UDPLite", 253: "Experimental-1", 254: "Experimental-2",
+}
+
+children = []
+stopping = False
+BASELINE_INPUT = set()
+
+
+def log(msg=""):
+    print(msg, flush=True)
+
+
+def run(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    except Exception:
+        return subprocess.CompletedProcess(cmd, 1, "", "")
+
+
+# ----------------------------------------------------------------------------
+# Process + firewall hygiene (RawSocket installs iptables rules while it runs)
+# ----------------------------------------------------------------------------
+def stop_proc(p, grace=6):
+    if p is None or p.poll() is not None:
+        return
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            p.send_signal(sig)
+        except Exception:
+            return
+        t0 = time.time()
+        while time.time() - t0 < grace:
+            if p.poll() is not None:
+                return
+            time.sleep(0.1)
+    try:
+        p.kill()
+    except Exception:
+        pass
+
+
+def purge_rules():
+    """Remove only the firewall rules WaterWall's RawSocket may have left behind."""
+    removed = 0
+    out = run(["iptables-save", "-t", "raw"]).stdout
+    for line in out.splitlines():
+        if line.startswith("-A") and ("WWRAW_NOTRACK" in line or "WWCAP_NOTRACK" in line):
+            if run(["iptables", "-t", "raw"] + shlex.split(line.replace("-A", "-D", 1))).returncode == 0:
+                removed += 1
+    out = run(["iptables", "-S", "INPUT"]).stdout
+    for line in out.splitlines():
+        if line.startswith("-A") and "NFQUEUE" in line and line not in BASELINE_INPUT:
+            if run(["iptables"] + shlex.split(line.replace("-A", "-D", 1))).returncode == 0:
+                removed += 1
+    return removed
+
+
+def on_signal(signum, frame):
+    global stopping
+    if stopping:
+        return
+    stopping = True
+    log("\n" + R_ + " [!] Interrupted - stopping WaterWall and restoring firewall rules..." + N)
+    for p in list(children):
+        stop_proc(p, grace=4)
+    n = purge_rules()
+    if n:
+        log(f" [i] Removed {n} leftover firewall rule(s).")
+    os._exit(130)
+
+
+signal.signal(signal.SIGINT, on_signal)
+signal.signal(signal.SIGTERM, on_signal)
+
+
+# ----------------------------------------------------------------------------
+# Control channel (plain TCP, newline-delimited JSON + raw bytes for speed test)
+# ----------------------------------------------------------------------------
+class Chan:
+    def __init__(self, s):
+        self.s = s
+        self.buf = b""
+
+    def send(self, obj):
+        self.s.sendall(json.dumps(obj).encode() + b"\n")
+
+    def recv(self, timeout=60):
+        self.s.settimeout(timeout)
+        while b"\n" not in self.buf:
+            d = self.s.recv(65536)
+            if not d:
+                raise ConnectionError("peer closed the control channel")
+            self.buf += d
+        line, self.buf = self.buf.split(b"\n", 1)
+        return json.loads(line.decode())
+
+    def stream_send(self, seconds):
+        chunk = b"W" * 65536
+        self.s.settimeout(10)
+        end = time.time() + seconds
+        while time.time() < end:
+            self.s.sendall(chunk)
+        self.s.sendall(TERM_MARK)
+
+    def stream_recv(self, max_wait):
+        self.s.settimeout(max_wait)
+        total, t_first, t_last, tail = 0, None, None, b""
+        data = self.buf
+        self.buf = b""
+        while True:
+            if data:
+                now = time.time()
+                if t_first is None:
+                    t_first = now
+                t_last = now
+                total += len(data)
+                tail = (tail + data)[-16:]
+                if TERM_MARK in tail:
+                    total -= len(TERM_MARK)
+                    break
+            data = self.s.recv(262144)
+            if not data:
+                raise ConnectionError("peer closed during speed test")
+        dt = max((t_last - t_first), 0.05) if t_first else 0.05
+        return round(total * 8 / dt / 1e6, 1)
+
+
+def open_channel():
+    log(f"{C}[*] Connecting control channel with peer {PEER_IP}:{SYNC_PORT} (waiting up to 90s)...{N}")
+    deadline = time.time() + 90
+    if IS_SERVER:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("0.0.0.0", SYNC_PORT))
+        srv.listen(4)
+        while time.time() < deadline:
+            srv.settimeout(max(0.5, deadline - time.time()))
+            try:
+                s, addr = srv.accept()
+            except socket.timeout:
+                break
+            if addr[0] == PEER_IP:
+                srv.close()
+                return Chan(s)
+            s.close()
+        srv.close()
+    else:
+        while time.time() < deadline:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(3)
+                s.connect((PEER_IP, SYNC_PORT))
+                return Chan(s)
+            except Exception:
+                time.sleep(1)
+    return None
+
+
+# ----------------------------------------------------------------------------
+# WaterWall config generation (written next to the core so you can inspect them)
+# ----------------------------------------------------------------------------
+def local_source_ip():
+    out = run(["ip", "-4", "route", "get", PEER_IP]).stdout
+    m = re.search(r"\bsrc (\d+\.\d+\.\d+\.\d+)", out)
+    return m.group(1) if m else THIS_IP
+
+
+def write_core_json(d, cfg_name):
+    workers = max(1, min(os.cpu_count() or 1, 4))
+    core = {
+        "log": {
+            "path": "log/",
+            "internal": {"loglevel": "INFO", "file": "internal.log", "console": True},
+            "core": {"loglevel": "INFO", "file": "core.log", "console": True},
+            "network": {"loglevel": "INFO", "file": "network.log", "console": True},
+            "dns": {"loglevel": "SILENT", "file": "dns.log", "console": False},
+        },
+        "misc": {"workers": workers, "ram-profile": "client", "mtu": 1500,
+                 "tcp-tune": False, "try-enabling-bbr": False, "libs-path": "libs/"},
+        "dns": {"domain-strategy": "prefer-ipv4"},
+        "configs": [cfg_name],
     }
-  },
-  "dns": {
-    "servers": [
-      "8.8.8.8",
-      "1.1.1.1"
-    ],
-    "domain-strategy": "prefer-ipv4"
-  },
-  "misc": {
-    "workers": ${workers},
-    "ram-profile": "server",
-    "mtu": 1500,
-    "try-enabling-bbr": true,
-    "libs-path": "libs/"
-  },
-  "configs": [
-    "${active_config}"
-  ]
+    with open(os.path.join(d, "core.json"), "w") as f:
+        json.dump(core, f, indent=2)
+
+
+def fresh_dir(name):
+    d = os.path.join(PROBE_DIR, name)
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def write_selfcheck():
+    d = fresh_dir("selfcheck")
+    cfg = {"name": "wwmng-selfcheck", "nodes": [
+        {"name": "gen", "type": "PacketGenerator",
+         "settings": {"source-ipv4-range": "198.51.100.10/32", "dest-ipv4": "203.0.113.20",
+                      "protocol-number": "ALL", "duration-ms": 500, "packets-per-ip": 2,
+                      "dest-port": 9, "src-port": "random"}, "next": "count"},
+        {"name": "count", "type": "PacketCounter",
+         "settings": {"source-ipv4-range": "198.51.100.10/32", "protocol-number": "ALL",
+                      "expected-packets-per-ip": 2, "report-after-ms": 2000,
+                      "output-file": "report.txt"}}]}
+    with open(os.path.join(d, "config_selfcheck.json"), "w") as f:
+        json.dump(cfg, f, indent=2)
+    write_core_json(d, "config_selfcheck.json")
+    return d
+
+
+def write_phase(ppi, duration_ms, report_ms, src_ip):
+    tx = fresh_dir("tx")
+    rx = fresh_dir("rx")
+    tx_cfg = {"name": "wwmng-probe-tx", "nodes": [
+        {"name": "gen", "type": "PacketGenerator",
+         "settings": {"source-ipv4-range": f"{src_ip}/32", "dest-ipv4": PEER_IP,
+                      "protocol-number": "ALL", "duration-ms": duration_ms,
+                      "packets-per-ip": ppi, "dest-port": DEST_PORT, "src-port": "random"},
+         "next": "raw-out"},
+        {"name": "raw-out", "type": "RawSocket",
+         "settings": {"raw-device-name": "wwmng-raw-out", "bypass-conntrack": True}}]}
+    rx_cfg = {"name": "wwmng-probe-rx", "nodes": [
+        {"name": "raw-in", "type": "RawSocket",
+         "settings": {"capture-filter-mode": "source-ip", "capture-ip": PEER_IP,
+                      "dont-capture-protocols": [6],
+                      "capture-device-name": "wwmng-capture-in",
+                      "raw-device-name": "wwmng-raw-in", "bypass-conntrack": True},
+         "next": "count"},
+        {"name": "count", "type": "PacketCounter",
+         "settings": {"source-ipv4-range": f"{PEER_IP}/32", "protocol-number": "ALL",
+                      "expected-packets-per-ip": ppi, "report-after-ms": report_ms,
+                      "output-file": "report.txt"}}]}
+    with open(os.path.join(tx, "config_probe_tx.json"), "w") as f:
+        json.dump(tx_cfg, f, indent=2)
+    with open(os.path.join(rx, "config_probe_rx.json"), "w") as f:
+        json.dump(rx_cfg, f, indent=2)
+    write_core_json(tx, "config_probe_tx.json")
+    write_core_json(rx, "config_probe_rx.json")
+    return tx, rx
+
+
+def start_core(d):
+    lf = open(os.path.join(d, "run.log"), "w")
+    p = subprocess.Popen([WW_BIN], cwd=d, stdout=lf, stderr=subprocess.STDOUT,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
+    children.append(p)
+    return p
+
+
+def read_log(d):
+    try:
+        with open(os.path.join(d, "run.log"), errors="ignore") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+def fatal_lines(d):
+    return [l for l in read_log(d).splitlines() if " FATAL " in l or " ERROR " in l][-6:]
+
+
+def wait_for(p, d, pattern, timeout):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        txt = read_log(d)
+        if re.search(pattern, txt):
+            return True
+        if " FATAL " in txt or p.poll() is not None:
+            return False
+        time.sleep(0.2)
+    return False
+
+
+def parse_report(d):
+    res = {}
+    try:
+        with open(os.path.join(d, "report.txt")) as f:
+            for line in f:
+                parts = [x.strip() for x in line.split("|")]
+                if len(parts) >= 6 and parts[1].isdigit():
+                    res[int(parts[1])] = int(parts[3])
+    except Exception:
+        pass
+    return res
+
+
+# ----------------------------------------------------------------------------
+# Test stages
+# ----------------------------------------------------------------------------
+def self_check():
+    log(f"{C}[*] Step 1/4: WaterWall core self-check (PacketGenerator -> PacketCounter)...{N}")
+    d = write_selfcheck()
+    p = start_core(d)
+    try:
+        p.wait(timeout=25)
+    except subprocess.TimeoutExpired:
+        stop_proc(p)
+    rep = parse_report(d)
+    if len(rep) < 200 or sum(rep.values()) < 200:
+        log(R_ + " [!] This WaterWall build did not run the packet-test nodes correctly." + N)
+        for l in fatal_lines(d):
+            log("     " + l)
+        log("     Try menu option 4 (Update Core), then run the Packet Tester again.")
+        return False
+    log(G + " [✓] Core OK: PacketGenerator / PacketCounter / RawSocket nodes are available." + N)
+    return True
+
+
+def tcp_speed(ch):
+    log(f"{C}[*] Step 2/4: TCP latency + real throughput over the control channel...{N}")
+    best = 1e9
+    for _ in range(5):
+        t0 = time.time()
+        ch.send({"cmd": "ping"})
+        ch.recv(10)
+        best = min(best, (time.time() - t0) * 1000)
+    # ping answering side
+    return round(best, 1)
+
+
+def serve_pings(ch, n=5):
+    for _ in range(n):
+        ch.recv(10)
+        ch.send({"cmd": "pong"})
+
+
+def speed_exchange(ch, secs=3):
+    """Returns (tx_mbps this->peer, rx_mbps peer->this), both really measured."""
+    if not IS_SERVER:
+        ch.send({"cmd": "speed_up"})
+        ch.stream_send(secs)
+        tx = ch.recv(secs + 15)["mbps"]
+        rx = ch.stream_recv(secs + 15)
+        ch.send({"mbps": rx})
+        return tx, rx
+    ch.recv(15)
+    rx = ch.stream_recv(secs + 15)
+    ch.send({"mbps": rx})
+    ch.stream_send(secs)
+    tx = ch.recv(secs + 15)["mbps"]
+    return tx, rx
+
+
+def run_phase(ch, label, ppi, duration_ms, src_ip, rtt_ms):
+    report_ms = duration_ms + 10000 + int(rtt_ms * 4)
+    tx_dir, rx_dir = write_phase(ppi, duration_ms, report_ms, src_ip)
+    log(f"{C}[*] {label}: {ppi} packets x 255 protocol numbers over {duration_ms/1000:.0f}s, both directions...{N}")
+    ch.send({"cmd": "go_rx"})
+    ch.recv(60)
+    rx = start_core(rx_dir)
+    ok = wait_for(rx, rx_dir, r"CaptureDevice:.* up with", 25)
+    if not ok:
+        log(R_ + " [!] WaterWall receiver failed to start:" + N)
+        for l in fatal_lines(rx_dir):
+            log("     " + l)
+        log("     RawSocket needs: root, iptables + iptables-save + ip, and kernel NFQUEUE support.")
+        stop_proc(rx)
+        ch.send({"cmd": "rx_failed"})
+        return None
+    ch.send({"cmd": "rx_ready"})
+    msg = ch.recv(60)
+    if msg.get("cmd") != "rx_ready":
+        log(R_ + " [!] Peer receiver failed to start; see peer output." + N)
+        stop_proc(rx)
+        return None
+    tx = start_core(tx_dir)
+    sent = wait_for(tx, tx_dir, r"finished transmitting", duration_ms / 1000 + 20)
+    if not sent:
+        log(R_ + " [!] WaterWall sender failed:" + N)
+        for l in fatal_lines(tx_dir):
+            log("     " + l)
+    time.sleep(0.5)
+    stop_proc(tx)
+    t0 = time.time()
+    while rx.poll() is None and time.time() - t0 < report_ms / 1000 + 20:
+        time.sleep(0.3)
+    if rx.poll() is None:
+        stop_proc(rx)
+    mine = parse_report(rx_dir)
+    ch.send({"cmd": "result", "rx": {str(k): v for k, v in mine.items()}})
+    peer_msg = ch.recv(report_ms / 1000 + 60)
+    theirs = {int(k): v for k, v in peer_msg.get("rx", {}).items()}
+    if not mine and not theirs:
+        return None
+    return {"ppi": ppi, "rx_from_peer": mine, "tx_to_peer": theirs}
+
+
+# ----------------------------------------------------------------------------
+# Summary
+# ----------------------------------------------------------------------------
+def pct(phase, key, p):
+    if not phase:
+        return None
+    v = phase[key].get(p, 0)
+    return min(100.0, round(100.0 * v / phase["ppi"], 1))
+
+
+def fmt(v):
+    return "  n/a " if v is None else f"{v:5.1f}%"
+
+
+def ranges(nums):
+    nums = sorted(nums)
+    out, i = [], 0
+    while i < len(nums):
+        j = i
+        while j + 1 < len(nums) and nums[j + 1] == nums[j] + 1:
+            j += 1
+        out.append(str(nums[i]) if i == j else f"{nums[i]}-{nums[j]}")
+        i = j + 1
+    return ", ".join(out) if out else "none"
+
+
+def summary(p1, p2, tcp, rtt, nat_note):
+    W = 100
+    log("\n" + "═" * W)
+    log(f" PACKET TEST SUMMARY   this={THIS_IP}  peer={PEER_IP}   control-channel RTT={rtt} ms")
+    if nat_note:
+        log(" " + nat_note)
+    log("═" * W)
+    head = f" {'PROTOCOL':<16}{'NUM':<5}{'TX ->peer':>10}{'RX <-peer':>10}"
+    if p2:
+        head += f"{'LOAD TX':>10}{'LOAD RX':>10}"
+    head += "   VERDICT"
+    log(head)
+    log("─" * W)
+    OPEN = 90.0
+    both_open, rows = [], {}
+    for n in range(0, 255):
+        if n == 6:
+            continue
+        t1, r1 = pct(p1, "tx_to_peer", n), pct(p1, "rx_from_peer", n)
+        t2, r2 = pct(p2, "tx_to_peer", n), pct(p2, "rx_from_peer", n)
+        rows[n] = (t1, r1, t2, r2)
+        if t1 >= OPEN and r1 >= OPEN and n != 0:
+            score = min(x for x in (t2, r2) if x is not None) if p2 else min(t1, r1)
+            both_open.append((score, min(t1, r1), n))
+
+    def verdict(t, r):
+        if t >= OPEN and r >= OPEN:
+            return G + "OPEN both ways" + N
+        if t >= OPEN and r == 0:
+            return Y + "only this->peer" + N
+        if r >= OPEN and t == 0:
+            return Y + "only peer->this" + N
+        if t >= OPEN or r >= OPEN:
+            return Y + f"lossy (TX {t:.0f}% / RX {r:.0f}%)" + N
+        if t > 0 or r > 0:
+            return Y + f"lossy (TX {t:.0f}% / RX {r:.0f}%)" + N
+        return R_ + "BLOCKED" + N
+
+    for n in sorted(PROTO_NAMES):
+        if n == 6:
+            line = f" {'TCP':<16}{'6':<5}{'OPEN':>10}{'OPEN':>10}"
+            if p2:
+                line += f"{'OPEN':>10}{'OPEN':>10}"
+            line += "   " + G + f"OPEN both ways (↑{tcp[0]} Mbps ↓{tcp[1]} Mbps)" + N
+            log(line)
+            continue
+        t1, r1, t2, r2 = rows[n]
+        line = f" {PROTO_NAMES[n]:<16}{str(n):<5}{fmt(t1):>10}{fmt(r1):>10}"
+        if p2:
+            line += f"{fmt(t2):>10}{fmt(r2):>10}"
+        line += "   " + verdict(t1, r1)
+        log(line)
+    log("═" * W)
+    both_open.sort(key=lambda x: (-x[0], -x[1], x[2]))
+    log(f"\n {B}TUNNELING RECOMMENDATIONS{N}  (TX ->peer / RX <-peer = share of packets that arrived; OPEN >= {OPEN:.0f}%)")
+    log("─" * W)
+    log(f" TCP (6)   : open both ways, measured {tcp[0]} Mbps up / {tcp[1]} Mbps down (real TCP stream).")
+    if both_open:
+        best = [x for x in both_open][:8]
+        log(" Best IP protocol numbers (open both ways, ranked by delivery" + (" under load):" if p2 else "):"))
+        for i, (score, base, n) in enumerate(best, 1):
+            nm = PROTO_NAMES.get(n, "unassigned/other")
+            log(f"   {i}. protocol {n:<3} ({nm})  delivery {score}%")
+        log(f"\n All protocol numbers open both ways : {ranges([n for _, _, n in both_open])}")
+    else:
+        log(R_ + " No IP protocol number was open in both directions at once." + N)
+        log("  Make sure the test was started on both servers and nothing filters raw IP between them.")
+    one_way = [n for n, (t1, r1, _, _) in rows.items() if (t1 >= OPEN) != (r1 >= OPEN)]
+    blocked = [n for n, (t1, r1, _, _) in rows.items() if t1 < OPEN and r1 < OPEN]
+    log(f" Open in ONE direction only          : {ranges(one_way)}")
+    log(f" Blocked / lossy both directions     : {ranges(blocked)}")
+    log("─" * W)
+    log(" Note: WaterWall's packet nodes measure delivery (loss) per protocol, not Mbps. Real Mbps is only")
+    log(" shown for TCP. Measure a protocol's true speed after building a tunnel on it (e.g. SpeedTest nodes).")
+    log("═" * W)
+
+
+# ----------------------------------------------------------------------------
+def main():
+    for tool in ("iptables", "iptables-save", "ip"):
+        if not shutil.which(tool):
+            log(R_ + f"[!] '{tool}' not found. WaterWall's RawSocket needs iptables + iproute2." + N)
+            log("    Debian/Ubuntu: apt-get install -y iptables iproute2")
+            return 2
+    if not os.access(WW_BIN, os.X_OK):
+        log(R_ + f"[!] WaterWall binary not executable: {WW_BIN}" + N)
+        return 2
+    BASELINE_INPUT.update(run(["iptables", "-S", "INPUT"]).stdout.splitlines())
+    purge_rules_start = purge_rules()
+    if purge_rules_start:
+        log(f" [i] Cleaned {purge_rules_start} stale WaterWall firewall rule(s) from an earlier run.")
+    os.makedirs(PROBE_DIR, exist_ok=True)
+
+    src_ip = local_source_ip()
+    nat_note = ""
+    if src_ip != THIS_IP:
+        nat_note = f"NAT detected: packets are sent from local {src_ip} (public {THIS_IP})."
+        log(Y + " [i] " + nat_note + N)
+    log(Y + " [!] During the test, packets from the peer are captured by WaterWall (TCP excluded)." + N)
+    log(Y + "     Stop other tunnels/VPNs between these two IPs first, or they will drop briefly." + N)
+
+    if not self_check():
+        return 3
+    ch = open_channel()
+    if ch is None:
+        log(R_ + f"[!] Peer did not connect on {PEER_IP}:{SYNC_PORT}. Start the Packet Tester on the other server" + N)
+        log("    and make sure TCP port " + str(SYNC_PORT) + " is open on the kharej server's firewall.")
+        return 4
+    log(G + " [✓] Peer connected." + N)
+
+    mode = MODE
+    if not IS_SERVER:
+        ch.send({"cmd": "hello", "mode": mode, "this": THIS_IP, "peer": PEER_IP})
+        ack = ch.recv(20)
+        if ack.get("cmd") != "hello_ack":
+            log(R_ + "[!] Unexpected reply from peer." + N)
+            return 4
+    else:
+        hello = ch.recv(30)
+        mode = hello.get("mode", "quick")
+        if hello.get("peer") != THIS_IP or hello.get("this") != PEER_IP:
+            log(Y + f" [!] IP mismatch: peer says it is {hello.get('this')} and targets {hello.get('peer')}." + N)
+        ch.send({"cmd": "hello_ack"})
+        log(f" [i] Test mode chosen by the Iran side: {mode}")
+
+    # step 2: RTT + TCP speed
+    if IS_SERVER:
+        serve_pings(ch)
+        rtt = None
+    else:
+        rtt = tcp_speed(ch)
+    if IS_SERVER:
+        rtt = ch.recv(10)["rtt"]
+    else:
+        ch.send({"rtt": rtt})
+    tcp = speed_exchange(ch)
+    log(f"{G} [✓] RTT {rtt} ms, TCP {tcp[0]} Mbps (this->peer) / {tcp[1]} Mbps (peer->this){N}")
+
+    log(f"{C}[*] Step 3/4: WaterWall protocol scan (all 255 IP protocol numbers, both directions)...{N}")
+    p1 = run_phase(ch, "Scan", 20, 4000, src_ip, rtt)
+    if p1 is None:
+        log(R_ + "[!] The scan produced no data. See messages above." + N)
+        purge_rules()
+        return 5
+    p2 = None
+    if mode == "full":
+        log(f"{C}[*] Step 4/4: Load test (higher packet rate per protocol)...{N}")
+        p2 = run_phase(ch, "Load", 600, 4000, src_ip, rtt)
+    left = purge_rules()
+    if left:
+        log(f" [i] Removed {left} leftover firewall rule(s) after the test.")
+    summary(p1, p2, tcp, rtt, nat_note)
+    try:
+        ch.s.close()
+    except Exception:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        rc = main()
+    except (ConnectionError, socket.timeout, OSError, json.JSONDecodeError) as e:
+        log(R_ + f"[!] Test aborted: {e}" + N)
+        rc = 6
+    finally:
+        for p in list(children):
+            stop_proc(p, grace=4)
+        purge_rules()
+    sys.exit(rc)
+PYEOF
+    chmod 600 "$PROBE_PY"
 }
-EOF
-}
 
-generate_probe_configs() {
-    local this_ip="$1"
-    local peer_ip="$2"
-    local role="$3"
-
-    local iran_ip="$this_ip"
-    local kharej_ip="$peer_ip"
-    if [[ "$role" == "kharej" ]]; then
-        iran_ip="$peer_ip"
-        kharej_ip="$this_ip"
-    fi
-
-    if [[ -f "$WW_CORE_JSON" ]]; then
-        BACKUP_CORE_JSON="${WW_DIR}/.core.json.bak"
-        cp -f "$WW_CORE_JSON" "$BACKUP_CORE_JSON"
-    fi
-
-    ROLLBACK_FILES=(
-        "${WW_DIR}/config_probe_iran.json"
-        "${WW_DIR}/config_probe_kharej.json"
-        "${WW_DIR}/core.json"
-    )
-
-    cat > "${WW_DIR}/config_probe_iran.json" <<EOF
-{
-  "name": "wwmng-packet-probe-iran",
-  "nodes": [
-    {
-      "name": "probe-sender",
-      "type": "PacketSender",
-      "settings": {
-        "interval": 100
-      },
-      "next": "ip-override-src"
-    },
-    {
-      "name": "ip-override-src",
-      "type": "IpOverrider",
-      "settings": {
-        "direction": "up",
-        "mode": "source-ip",
-        "ipv4": "${iran_ip}"
-      },
-      "next": "ip-override-dst"
-    },
-    {
-      "name": "ip-override-dst",
-      "type": "IpOverrider",
-      "settings": {
-        "direction": "up",
-        "mode": "dest-ip",
-        "ipv4": "${kharej_ip}"
-      },
-      "next": "raw-outbound"
-    },
-    {
-      "name": "raw-outbound",
-      "type": "RawSocket",
-      "settings": {
-        "capture-filter-mode": "source-ip",
-        "capture-ip": "${kharej_ip}",
-        "kernel-queue-tune": true
-      },
-      "next": "probe-receiver"
-    },
-    {
-      "name": "probe-receiver",
-      "type": "PacketReceiver",
-      "settings": {}
-    }
-  ]
-}
-EOF
-
-    cat > "${WW_DIR}/config_probe_kharej.json" <<EOF
-{
-  "name": "wwmng-packet-probe-kharej",
-  "nodes": [
-    {
-      "name": "probe-sender",
-      "type": "PacketSender",
-      "settings": {
-        "interval": 100
-      },
-      "next": "ip-override-src"
-    },
-    {
-      "name": "ip-override-src",
-      "type": "IpOverrider",
-      "settings": {
-        "direction": "up",
-        "mode": "source-ip",
-        "ipv4": "${kharej_ip}"
-      },
-      "next": "ip-override-dst"
-    },
-    {
-      "name": "ip-override-dst",
-      "type": "IpOverrider",
-      "settings": {
-        "direction": "up",
-        "mode": "dest-ip",
-        "ipv4": "${iran_ip}"
-      },
-      "next": "raw-outbound"
-    },
-    {
-      "name": "raw-outbound",
-      "type": "RawSocket",
-      "settings": {
-        "capture-filter-mode": "source-ip",
-        "capture-ip": "${iran_ip}",
-        "kernel-queue-tune": true
-      },
-      "next": "probe-receiver"
-    },
-    {
-      "name": "probe-receiver",
-      "type": "PacketReceiver",
-      "settings": {}
-    }
-  ]
-}
-EOF
-
-    if [[ "$role" == "iran" ]]; then
-        generate_core_json "config_probe_iran.json"
-    else
-        generate_core_json "config_probe_kharej.json"
-    fi
-}
-
-# ==============================================================================
-# BIDIRECTIONAL PROTOCOL & THROUGHPUT ENGINE
-# ==============================================================================
-
-run_bidirectional_probe_engine() {
+run_packet_probe() {
     local this_ip="$1"
     local peer_ip="$2"
     local role="$3"
     local sync_port="$4"
-    local active_cfg="config_probe_${role}.json"
+    local mode="$5"
 
-    echo ""
-    echo -e "${CYAN}[*] Step 1/3: Launching WaterWall Core with ${BOLD}${active_cfg}${NC}${CYAN}...${NC}"
-    rm -f "${WW_DIR}/log/"*.log 2>/dev/null
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo -e "${RED}[!] python3 is required for the Packet Tester.${NC}"
+        return 1
+    fi
+    if [[ ! -x "$WW_BIN" ]]; then
+        echo -e "${RED}[!] WaterWall core is not installed. Use option 4 (Update Core) first.${NC}"
+        return 1
+    fi
 
-    (
-        cd "$WW_DIR" || exit
-        timeout 6 "$WW_BIN" > "${WW_DIR}/log/stdout.log" 2>&1
-    ) &
-    ACTIVE_WW_PID=$!
+    write_probe_script
+    mkdir -p "$PROBE_DIR"
 
-    local spin='-\|/'
-    local i=0
-    while kill -0 "$ACTIVE_WW_PID" 2>/dev/null; do
-        i=$(( (i+1) % 4 ))
-        printf "\r${YELLOW}    [WaterWall Core Probing] Running PacketSender/RawSocket/PacketReceiver... %s${NC}" "${spin:$i:1}"
-        sleep 0.2
-    done
-    ACTIVE_WW_PID=""
-    printf "\r${GREEN}[✓] WaterWall Core native probe cycle completed.                                  ${NC}\n"
-
-    echo -e "${CYAN}[*] Step 2/3: Running Bidirectional Raw IP Protocol & Speed Benchmark (Both Ways)...${NC}"
-    echo -e "${YELLOW}    Make sure Packet Tester is also running on Peer (${peer_ip}) with the matching port (${sync_port}).${NC}"
-
-    python3 - "$this_ip" "$peer_ip" "$role" "$sync_port" "${WW_DIR}/log/core.log" << 'PYEOF' &
-import sys, socket, struct, time, json, select, os
-
-this_ip = sys.argv[1]
-peer_ip = sys.argv[2]
-role = sys.argv[3]
-sync_port = int(sys.argv[4])
-ww_log_path = sys.argv[5]
-
-PROTOCOLS = [
-    ("ICMP",       1,   "PingClient / PingServer / RawSocket"),
-    ("IPIP",       4,   "TunDevice -> IpOverrider -> RawSocket (IP-in-IP)"),
-    ("TCP",        6,   "TcpListener -> MuxClient -> TcpConnector"),
-    ("UDP",        17,  "UdpStatelessSocket / WireGuardDevice"),
-    ("IPv6-Encap", 41,  "TunDevice -> IpManipulator (Proto 41) -> RawSocket"),
-    ("GRE",        47,  "TunDevice -> IpManipulator (Proto 47) -> RawSocket"),
-    ("ESP",        50,  "TunDevice -> IpManipulator (Proto 50) -> RawSocket"),
-    ("AH",         51,  "TunDevice -> IpManipulator (Proto 51) -> RawSocket"),
-    ("OSPF",       89,  "TunDevice -> IpManipulator (Proto 89) -> RawSocket"),
-    ("L2TP",       115, "TunDevice -> IpManipulator (Proto 115) -> RawSocket"),
-    ("SCTP",       132, "TunDevice -> IpManipulator (Proto 132) -> RawSocket"),
-    ("UDPLite",    136, "TunDevice -> IpManipulator (Proto 136) -> RawSocket"),
-]
-
-MAGIC = b"WWMNG_PROBE_V1"
-
-def send_raw_probes(target_ip):
-    for name, proto_num, _ in PROTOCOLS:
-        if name in ("TCP", "UDP"):
-            continue
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_RAW, proto_num)
-            s.settimeout(0.4)
-            payload = MAGIC + struct.pack("!B", proto_num) + (b"X" * 512)
-            if proto_num == 1:
-                header = struct.pack("!BBHHH", 8, 0, 0, 1234, 1)
-                chksum = 0
-                pkt = header + payload
-                for i in range(0, len(pkt), 2):
-                    w = (pkt[i] << 8) + (pkt[i+1] if i+1 < len(pkt) else 0)
-                    chksum = (chksum + w) & 0xffffffff
-                chksum = (chksum >> 16) + (chksum & 0xffff)
-                chksum = ~chksum & 0xffff
-                pkt = struct.pack("!BBHHH", 8, 0, chksum, 1234, 1) + payload
-                for _ in range(4):
-                    s.sendto(pkt, (target_ip, 0))
-            else:
-                for _ in range(4):
-                    s.sendto(payload, (target_ip, 0))
-            s.close()
-        except Exception:
-            pass
-
-def listen_raw_probes(duration=3.5):
-    received_protos = set()
-    raw_socks = []
-    for name, proto_num, _ in PROTOCOLS:
-        if name in ("TCP", "UDP"):
-            continue
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_RAW, proto_num)
-            s.setblocking(False)
-            raw_socks.append((proto_num, s))
-        except Exception:
-            pass
-
-    end_time = time.time() + duration
-    while time.time() < end_time:
-        rlist = [s for _, s in raw_socks]
-        if not rlist:
-            break
-        readable, _, _ = select.select(rlist, [], [], 0.2)
-        for s in readable:
-            try:
-                data, addr = s.recvfrom(65535)
-                if addr[0] == peer_ip or MAGIC in data:
-                    for pnum, sock_obj in raw_socks:
-                        if sock_obj == s:
-                            received_protos.add(pnum)
-            except Exception:
-                pass
-
-    for _, s in raw_socks:
-        s.close()
-    return received_protos
-
-def test_tcp_udp_and_sync():
-    local_report = {
-        "tx_rx_open": {},
-        "speed_up_mbps": {},
-        "speed_down_mbps": {},
-        "latency_ms": {}
-    }
-
-    ctrl_sock = None
-    is_server = (role == "kharej")
-
-    print(f"    [*] Connecting control channel with Peer ({peer_ip}:{sync_port})...")
-    start_wait = time.time()
-    if is_server:
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("0.0.0.0", sync_port))
-        srv.listen(2)
-        srv.settimeout(25.0)
-        try:
-            ctrl_sock, _ = srv.accept()
-        except Exception:
-            pass
-        srv.close()
-    else:
-        while time.time() - start_wait < 25.0:
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(2.0)
-                s.connect((peer_ip, sync_port))
-                ctrl_sock = s
-                break
-            except Exception:
-                time.sleep(1.0)
-
-    peer_synced = ctrl_sock is not None
-    if peer_synced:
-        print("    [✓] Peer connected! Executing synchronized two-way protocol & speed test...")
-        ctrl_sock.settimeout(10.0)
-        t0 = time.time()
-        ctrl_sock.sendall(b"PING_TEST")
-        _ = ctrl_sock.recv(32)
-        rtt = round((time.time() - t0) * 1000.0, 2)
-
-        chunk = b"W" * 32768
-        if not is_server:
-            t_up = time.time()
-            sent_b = 0
-            while time.time() - t_up < 1.2:
-                try:
-                    sent_b += ctrl_sock.send(chunk)
-                except Exception:
-                    break
-            ctrl_sock.sendall(b"EOF_UP")
-            up_mbps = round((sent_b * 8) / ((time.time() - t_up) * 1e6), 2)
-
-            t_dn = time.time()
-            recv_b = 0
-            while time.time() - t_dn < 2.0:
-                try:
-                    d = ctrl_sock.recv(65536)
-                    if not d or b"EOF_DN" in d:
-                        recv_b += len(d)
-                        break
-                    recv_b += len(d)
-                except Exception:
-                    break
-            dn_mbps = round((recv_b * 8) / (max(time.time() - t_dn, 0.1) * 1e6), 2)
-        else:
-            t_dn = time.time()
-            recv_b = 0
-            while time.time() - t_dn < 2.0:
-                try:
-                    d = ctrl_sock.recv(65536)
-                    if not d or b"EOF_UP" in d:
-                        recv_b += len(d)
-                        break
-                    recv_b += len(d)
-                except Exception:
-                    break
-            dn_mbps = round((recv_b * 8) / (max(time.time() - t_dn, 0.1) * 1e6), 2)
-
-            t_up = time.time()
-            sent_b = 0
-            while time.time() - t_up < 1.2:
-                try:
-                    sent_b += ctrl_sock.send(chunk)
-                except Exception:
-                    break
-            ctrl_sock.sendall(b"EOF_DN")
-            up_mbps = round((sent_b * 8) / ((time.time() - t_up) * 1e6), 2)
-
-        local_report["tx_rx_open"][6] = ("OPEN", "OPEN")
-        local_report["speed_up_mbps"][6] = up_mbps
-        local_report["speed_down_mbps"][6] = dn_mbps
-        local_report["latency_ms"][6] = rtt
-
-        udp_port = sync_port + 1
-        u_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        u_sock.bind(("0.0.0.0", udp_port))
-        u_sock.settimeout(1.5)
-        u_pkt = MAGIC + b"UDP_SPEED_" + (b"U" * 1200)
-        for _ in range(150):
-            try:
-                u_sock.sendto(u_pkt, (peer_ip, udp_port))
-            except Exception:
-                pass
-        u_recv = 0
-        t_ur = time.time()
-        while time.time() - t_ur < 1.5:
-            try:
-                d, addr = u_sock.recvfrom(65535)
-                if addr[0] == peer_ip:
-                    u_recv += len(d)
-            except Exception:
-                break
-        u_sock.close()
-
-        if not is_server:
-            send_raw_probes(peer_ip)
-            rx_raw = listen_raw_probes(2.5)
-        else:
-            rx_raw = listen_raw_probes(2.5)
-            send_raw_probes(peer_ip)
-
-        if u_recv > 0:
-            rx_raw.add(17)
-
-        my_rx_list = sorted(list(rx_raw))
-        try:
-            msg = json.dumps({"rx": my_rx_list}).encode()
-            ctrl_sock.sendall(struct.pack("!I", len(msg)) + msg)
-            hdr = ctrl_sock.recv(4)
-            if len(hdr) == 4:
-                plen = struct.unpack("!I", hdr)[0]
-                peer_data = json.loads(ctrl_sock.recv(plen).decode())
-                peer_rx_set = set(peer_data.get("rx", []))
-            else:
-                peer_rx_set = set()
-        except Exception:
-            peer_rx_set = set()
-
-        ctrl_sock.close()
-
-        for name, pnum, _ in PROTOCOLS:
-            if pnum == 6:
-                continue
-            tx_state = "OPEN" if pnum in peer_rx_set else "BLOCKED"
-            rx_state = "OPEN" if pnum in rx_raw else "BLOCKED"
-            local_report["tx_rx_open"][pnum] = (tx_state, rx_state)
-            if tx_state == "OPEN" or rx_state == "OPEN":
-                factor = 1.05 if pnum in (4, 41, 47, 50, 115) else (1.08 if pnum == 17 else 0.45)
-                local_report["speed_up_mbps"][pnum] = round(up_mbps * factor, 2) if tx_state == "OPEN" else 0.0
-                local_report["speed_down_mbps"][pnum] = round(dn_mbps * factor, 2) if rx_state == "OPEN" else 0.0
-                local_report["latency_ms"][pnum] = rtt
-            else:
-                local_report["speed_up_mbps"][pnum] = 0.0
-                local_report["speed_down_mbps"][pnum] = 0.0
-                local_report["latency_ms"][pnum] = 0.0
-    else:
-        print("    [!] Peer control listener did not respond on port " + str(sync_port) + ". Running standalone active probe...")
-        send_raw_probes(peer_ip)
-        rx_raw = listen_raw_probes(3.0)
-
-        if os.path.exists(ww_log_path):
-            try:
-                with open(ww_log_path, "r", errors="ignore") as f:
-                    log_txt = f.read()
-                    for _, pnum, _ in PROTOCOLS:
-                        if f"proto: {pnum}" in log_txt or f"protocol {pnum}" in log_txt:
-                            rx_raw.add(pnum)
-            except Exception:
-                pass
-
-        icmp_ok = (os.system(f"ping -c 2 -W 1 {peer_ip} >/dev/null 2>&1") == 0)
-        if icmp_ok:
-            rx_raw.add(1)
-
-        for name, pnum, _ in PROTOCOLS:
-            st = "OPEN" if pnum in rx_raw else "BLOCKED/NO-REPLY"
-            local_report["tx_rx_open"][pnum] = (st, st)
-            local_report["speed_up_mbps"][pnum] = 0.0
-            local_report["speed_down_mbps"][pnum] = 0.0
-            local_report["latency_ms"][pnum] = 0.0
-
-    print("\n" + "═" * 98)
-    print(f" BIDIRECTIONAL PROTOCOL & SPEED SUMMARY ({this_ip} <===> {peer_ip})")
-    print("═" * 98)
-    print(f" {'PROTOCOL':<12} {'PROTO#':<8} {'TX (This->Peer)':<17} {'RX (Peer->This)':<17} {'UP SPEED':<14} {'DOWN SPEED':<14} {'RTT'}")
-    print("─" * 98)
-
-    open_both = []
-    open_oneway = []
-
-    for name, pnum, ww_chain in PROTOCOLS:
-        tx_st, rx_st = local_report["tx_rx_open"].get(pnum, ("BLOCKED", "BLOCKED"))
-        up_s = local_report["speed_up_mbps"].get(pnum, 0.0)
-        dn_s = local_report["speed_down_mbps"].get(pnum, 0.0)
-        lat = local_report["latency_ms"].get(pnum, 0.0)
-
-        up_str = f"{up_s} Mbps" if up_s > 0 else "N/A"
-        dn_str = f"{dn_s} Mbps" if dn_s > 0 else "N/A"
-        lat_str = f"{lat} ms" if lat > 0 else "N/A"
-
-        if tx_st == "OPEN" and rx_st == "OPEN":
-            open_both.append((name, pnum, (up_s + dn_s) / 2.0, ww_chain))
-        elif tx_st == "OPEN" or rx_st == "OPEN":
-            open_oneway.append((name, pnum, tx_st, rx_st, ww_chain))
-
-        print(f" {name:<12} {str(pnum):<8} {tx_st:<17} {rx_st:<17} {up_str:<14} {dn_str:<14} {lat_str}")
-
-    print("═" * 98)
-    print("\n WATERWALL TUNNELING RECOMMENDATIONS:")
-    print("─" * 98)
-    if open_both:
-        open_both.sort(key=lambda x: x[2], reverse=True)
-        for idx, (name, pnum, avg_spd, ww_chain) in enumerate(open_both, 1):
-            spd_badge = f" (Avg Speed: {round(avg_spd, 2)} Mbps)" if avg_spd > 0 else ""
-            print(f"  {idx}. [BEST - BIDIRECTIONAL OPEN] {name} (IP Proto {pnum}){spd_badge}")
-            print(f"     Recommended WaterWall Chain: {ww_chain}")
-    else:
-        print("  [!] No protocols were confirmed open in BOTH directions simultaneously.")
-        print("      Ensure Packet Tester was started on the Peer server at the same time.")
-
-    if open_oneway:
-        print("\n  [ASYMMETRIC / ONE-WAY PROTOCOLS DETECTED]:")
-        for name, pnum, tx_st, rx_st, ww_chain in open_oneway:
-            print(f"  * {name} (Proto {pnum}): TX={tx_st}, RX={rx_st} -> Can be combined in WaterWall asymmetric chains.")
-    print("═" * 98)
-
-test_tcp_udp_and_sync()
-PYEOF
+    python3 "$PROBE_PY" "$this_ip" "$peer_ip" "$role" "$sync_port" "$WW_BIN" "$PROBE_DIR" "$mode" &
     ACTIVE_PY_PID=$!
-    wait "$ACTIVE_PY_PID" 2>/dev/null
+    wait "$ACTIVE_PY_PID"
+    local rc=$?
     ACTIVE_PY_PID=""
 
-    ROLLBACK_FILES=()
-    if [[ -n "$BACKUP_CORE_JSON" && -f "$BACKUP_CORE_JSON" ]]; then
-        rm -f "$BACKUP_CORE_JSON"
+    echo ""
+    if [[ $rc -eq 0 ]]; then
+        echo -e "${GREEN}[✓] Packet test finished. Generated configs are in ${PROBE_DIR}/tx and ${PROBE_DIR}/rx${NC}"
+    else
+        echo -e "${YELLOW}[!] Packet test ended with code ${rc}.${NC}"
     fi
-    BACKUP_CORE_JSON=""
+    return $rc
 }
 
 # ==============================================================================
@@ -880,9 +1000,12 @@ menu_packet_tester() {
         print_banner
         echo -e "${BOLD}${MAGENTA}>>> WaterWall Packet Tester & Bidirectional Protocol Probe${NC}"
         echo -e "${BLUE}──────────────────────────────────────────────────────────────────────────${NC}"
-        echo -e "Select this server's role for the probe:"
-        echo -e "  ${GREEN}1)${NC} Iran / Initiator Node  (Generates & runs ${BOLD}config_probe_iran.json${NC})"
-        echo -e "  ${GREEN}2)${NC} Kharej / Responder Node (Generates & runs ${BOLD}config_probe_kharej.json${NC})"
+        echo -e "Tests which of the 255 IP protocol numbers pass between two servers, both ways,"
+        echo -e "using WaterWall itself. Run it on BOTH servers at about the same time."
+        echo ""
+        echo -e "Select this server's role:"
+        echo -e "  ${GREEN}1)${NC} Iran   (connects to the peer and chooses the test mode)"
+        echo -e "  ${GREEN}2)${NC} Kharej (waits for the Iran side; its sync port must be reachable)"
         echo -e "  ${CYAN}0)${NC} Back to Main Menu"
         echo ""
         read -rp "$(echo -e "${CYAN}Select role [0-2]: ${NC}")" role_choice
@@ -907,6 +1030,7 @@ menu_packet_tester() {
         local this_ip=""
         local peer_ip=""
         local sync_port=""
+        local mode="quick"
 
         echo ""
         if ! prompt_input "Enter THIS server's Public IP" "$detected_ip" this_ip; then
@@ -917,18 +1041,28 @@ menu_packet_tester() {
             continue
         fi
 
-        if ! prompt_input "Enter Coordination Port for Bidirectional Speed Test" "54321" sync_port; then
+        if ! prompt_input "Enter Coordination Port (TCP, must be open on the Kharej server)" "54321" sync_port; then
             continue
         fi
 
-        echo ""
-        echo -e "${CYAN}[*] Generating WaterWall configuration files in ${WW_DIR}...${NC}"
-        generate_probe_configs "$this_ip" "$peer_ip" "$role_name"
-        echo -e "${GREEN}[✓] Created: ${WW_DIR}/core.json${NC}"
-        echo -e "${GREEN}[✓] Created: ${WW_DIR}/config_probe_iran.json${NC}"
-        echo -e "${GREEN}[✓] Created: ${WW_DIR}/config_probe_kharej.json${NC}"
+        if [[ "$role_name" == "iran" ]]; then
+            echo ""
+            echo -e "Test mode:"
+            echo -e "  ${GREEN}1)${NC} Quick scan          (about 1 minute)"
+            echo -e "  ${GREEN}2)${NC} Scan + load test    (about 1.5 minutes, shows loss at a higher packet rate)"
+            read -rp "$(echo -e "${CYAN}Select mode [1-2, default 1]: ${NC}")" mode_choice
+            if is_back "$mode_choice"; then
+                continue
+            fi
+            if [[ "$mode_choice" == "2" ]]; then
+                mode="full"
+            fi
+        else
+            echo -e "${YELLOW}[i] The test mode is chosen on the Iran side.${NC}"
+        fi
 
-        run_bidirectional_probe_engine "$this_ip" "$peer_ip" "$role_name" "$sync_port"
+        echo ""
+        run_packet_probe "$this_ip" "$peer_ip" "$role_name" "$sync_port" "$mode"
 
         pause_back
         return 0
@@ -979,7 +1113,10 @@ menu_uninstall() {
 
     echo ""
     echo -e "${CYAN}[*] Stopping running WaterWall processes...${NC}"
+    pkill -TERM -f "${WW_BIN}" 2>/dev/null
+    sleep 2
     pkill -9 -f "${WW_BIN}" 2>/dev/null
+    purge_ww_rules
 
     echo -e "${CYAN}[*] Stopping and removing any Waterwall-Manager / WaterWall systemd services...${NC}"
     for svc in /etc/systemd/system/wwmng*.service /etc/systemd/system/waterwall*.service /etc/systemd/system/astro-tun*.service; do
