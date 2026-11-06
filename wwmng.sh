@@ -90,7 +90,6 @@ handle_interrupt() {
     exit 130
 }
 
-# Remove only the firewall rules WaterWall's RawSocket tags with its own comments.
 purge_ww_rules() {
     if ! command -v iptables-save >/dev/null 2>&1; then
         return 0
@@ -147,14 +146,14 @@ prompt_input() {
     local user_input=""
 
     if [[ -n "$default_val" ]]; then
-        read -rp "$(echo -e "${CYAN}${prompt_text} [${GREEN}${default_val}${CYAN}] (or '0' to go back): ${NC}")" user_input
+        read -rp "$(echo -e "${CYAN}${prompt_text} [${GREEN}${default_val}${CYAN}]: ${NC}")" user_input
         if is_back "$user_input"; then
             return 1
         fi
         user_input="${user_input:-$default_val}"
     else
         while [[ -z "$user_input" ]]; do
-            read -rp "$(echo -e "${CYAN}${prompt_text} (or '0' to go back): ${NC}")" user_input
+            read -rp "$(echo -e "${CYAN}${prompt_text}: ${NC}")" user_input
             if is_back "$user_input"; then
                 return 1
             fi
@@ -1031,7 +1030,7 @@ menu_create_tunnel() {
         print_banner
         echo -e "${BOLD}${MAGENTA}>>> Create a Tunnel (Select Transport)${NC}"
         echo -e "${BLUE}──────────────────────────────────────────────────────────────────────────${NC}"
-        echo -e "  ${GREEN}1)${NC} BitSwapMux  (${CYAN}transports/bitswapmux.sh${NC} - Multi-Port TCP/UDP + TUN + BitSwap)"
+        echo -e "  ${GREEN}1)${NC} BitSwapMux  ${CYAN}(Multiplexed tunnel that evades DPI by swapping TCP header flags)${NC}"
         echo -e "  ${CYAN}0)${NC} Back to Main Menu"
         echo -e "${BLUE}──────────────────────────────────────────────────────────────────────────${NC}"
         read -rp "$(echo -e "${CYAN}Select transport [0-1]: ${NC}")" trans_choice
@@ -1246,6 +1245,9 @@ menu_packet_tester() {
         local mode="quick"
 
         echo ""
+        echo -e "${YELLOW}Press 0 to go back anytime.${NC}"
+        echo -e "${BLUE}──────────────────────────────────────────────────────────────────────────${NC}"
+
         if ! prompt_input "Enter THIS server's Public IP" "$detected_ip" this_ip; then
             continue
         fi
