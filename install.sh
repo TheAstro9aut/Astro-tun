@@ -29,7 +29,6 @@ fi
 rm -f /usr/local/bin/astro-tun 2>/dev/null
 
 echo -e "${CYAN}[*] Installing required system packages...${NC}"
-# iptables is required by WaterWall's RawSocket node (packet tester and raw tunnels).
 if command -v apt-get &>/dev/null; then
     apt-get update -y -qq
     apt-get install -y -qq curl wget unzip jq socat iproute2 iptables netcat-openbsd bc python3 libcap2-bin >/dev/null 2>&1
@@ -39,9 +38,9 @@ elif command -v pacman &>/dev/null; then
     pacman -Sy --noconfirm --needed curl wget unzip jq socat iproute2 iptables openbsd-netcat bc python libcap >/dev/null 2>&1
 fi
 
-mkdir -p "$INSTALL_DIR"/{log,libs,configs,results}
+mkdir -p "$INSTALL_DIR"/{log,libs,configs,results,transports}
 
-echo -e "${CYAN}[*] Downloading Waterwall-Manager (wwmng)...${NC}"
+echo -e "${CYAN}[*] Downloading Waterwall-Manager (wwmng) and transports...${NC}"
 TMP_DL=$(mktemp)
 if [[ -f "./wwmng.sh" ]]; then
     cp "./wwmng.sh" "$BIN_PATH"
@@ -50,6 +49,15 @@ else
     mv -f "$TMP_DL" "$BIN_PATH"
 fi
 chmod +x "$BIN_PATH"
+
+if [[ -f "./transports/bitswapmux.sh" ]]; then
+    cp "./transports/bitswapmux.sh" "$INSTALL_DIR/transports/bitswapmux.sh"
+    chmod +x "$INSTALL_DIR/transports/bitswapmux.sh"
+else
+    if curl -fsSL "$REPO_RAW_URL/transports/bitswapmux.sh" -o "$INSTALL_DIR/transports/bitswapmux.sh" 2>/dev/null; then
+        chmod +x "$INSTALL_DIR/transports/bitswapmux.sh"
+    fi
+fi
 
 echo -e "${GREEN}[✓] Waterwall-Manager installed! Run it anytime by typing: wwmng${NC}"
 sleep 1
