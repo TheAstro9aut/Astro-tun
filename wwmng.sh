@@ -10,8 +10,12 @@ WW_DIR="/opt/waterwall-manager"
 WW_BIN="${WW_DIR}/Waterwall"
 WW_VER_FILE="${WW_DIR}/.version"
 WW_CORE_JSON="${WW_DIR}/core.json"
+WW_TRANSPORTS_DIR="${WW_DIR}/transports"
+WW_SERVICE_NAME="wwmng-tunnel.service"
+WW_SERVICE_FILE="/etc/systemd/system/${WW_SERVICE_NAME}"
 WWMNG_BIN="/usr/local/bin/wwmng"
-WWMNG_RAW_URL="https://raw.githubusercontent.com/TheAstro9aut/Waterwall-Manager/main/wwmng.sh"
+REPO_RAW_BASE="https://raw.githubusercontent.com/TheAstro9aut/Waterwall-Manager/main"
+WWMNG_RAW_URL="${REPO_RAW_BASE}/wwmng.sh"
 WW_REPO="radkesvat/WaterWall"
 WW_API_LATEST="https://api.github.com/repos/${WW_REPO}/releases/latest"
 
@@ -30,17 +34,22 @@ NC='\033[0m'
 ACTIVE_TMP_DIR=""
 ACTIVE_WW_PID=""
 ACTIVE_PY_PID=""
+ROLLBACK_FILES=()
+IN_LOG_VIEW="false"
 
 # ==============================================================================
 # CTRL+C (SIGINT / SIGTERM) ROLLBACK & CLEANUP HANDLER
 # ==============================================================================
 
 handle_interrupt() {
+    if [[ "$IN_LOG_VIEW" == "true" ]]; then
+        IN_LOG_VIEW="false"
+        return 0
+    fi
+
     trap '' INT TERM
     echo -e "\n\n${RED}${BOLD}[!] Ctrl+C detected! Cancelling active operations and rolling back...${NC}"
 
-    # The packet tester (python) owns its WaterWall children: ask it to stop them
-    # gracefully so WaterWall removes the iptables rules it installed.
     if [[ -n "$ACTIVE_PY_PID" ]] && kill -0 "$ACTIVE_PY_PID" 2>/dev/null; then
         echo -e "${YELLOW}    -> Stopping Packet Tester and its WaterWall processes (PID: ${ACTIVE_PY_PID})...${NC}"
         kill -TERM "$ACTIVE_PY_PID" 2>/dev/null
@@ -55,8 +64,6 @@ handle_interrupt() {
         fi
     fi
 
-    # Only a core process started by this session is ever stopped here, so tunnels
-    # that are already running as services are never touched.
     if [[ -n "$ACTIVE_WW_PID" ]] && kill -0 "$ACTIVE_WW_PID" 2>/dev/null; then
         echo -e "${YELLOW}    -> Stopping active WaterWall process (PID: ${ACTIVE_WW_PID})...${NC}"
         kill -TERM "$ACTIVE_WW_PID" 2>/dev/null
@@ -69,18 +76,31 @@ handle_interrupt() {
         rm -rf "$ACTIVE_TMP_DIR"
     fi
 
+    if [[ ${#ROLLBACK_FILES[@]} -gt 0 ]]; then
+        local f
+        for f in "${ROLLBACK_FILES[@]}"; do
+            if [[ -e "$f" ]]; then
+                echo -e "${YELLOW}    -> Rolling back uncommitted file: ${f}${NC}"
+                rm -f "$f"
+            fi
+        done
+    fi
+
     echo -e "${GREEN}[✓] Rollback complete. Exiting Waterwall-Manager.${NC}"
     exit 130
 }
 
 # Remove only the firewall rules WaterWall's RawSocket tags with its own comments.
 purge_ww_rules() {
-    command -v iptables-save >/dev/null 2>&1 || return 0
+    if ! command -v iptables-save >/dev/null 2>&1; then
+        return 0
+    fi
     local rule
     while IFS= read -r rule; do
-        [[ "$rule" == -A* ]] || continue
-        eval "iptables -t raw ${rule/-A/-D}" 2>/dev/null
-    done < <(iptables-save -t raw 2>/dev/null | grep -E 'WW(RAW|CAP)_NOTRACK')
+        if [[ "$rule" == -A* ]]; then
+            eval "iptables -t raw ${rule/-A/-D}" 2>/dev/null
+        fi
+    done < <(iptables-save -t raw 2>/dev/null | grep -E "WWRAW_NOTRACK|WWCAP_NOTRACK")
 }
 
 trap handle_interrupt INT TERM
@@ -90,7 +110,7 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-mkdir -p "${WW_DIR}"/{log,libs,configs,results}
+mkdir -p "${WW_DIR}"/{log,libs,configs,results,transports}
 
 # ==============================================================================
 # UI BANNER & NAVIGATION HELPERS
@@ -98,6 +118,10 @@ mkdir -p "${WW_DIR}"/{log,libs,configs,results}
 
 print_banner() {
     clear
+    local ver_label="unknown"
+    if [[ -f "$WW_VER_FILE" ]]; then
+        ver_label=$(cat "$WW_VER_FILE" 2>/dev/null)
+    fi
     echo -e "  ${CYAN}██╗    ██╗ █████╗ ████████╗███████╗██████╗ ██╗    ██╗ █████╗ ██╗     ██╗${NC}  "
     echo -e "  ${CYAN}██║    ██║██╔══██╗╚══██╔══╝██╔════╝██╔══██╗██║    ██║██╔══██╗██║     ██║${NC}  "
     echo -e "  ${CYAN}██║ █╗ ██║███████║   ██║   █████╗  ██████╔╝██║ █╗ ██║███████║██║     ██║${NC}  "
@@ -105,7 +129,7 @@ print_banner() {
     echo -e "  ${CYAN}╚███╔███╔╝██║  ██║   ██║   ███████╗██║  ██║╚███╔███╔╝██║  ██║███████╗███████╗${NC}"
     echo -e "  ${CYAN} ╚══╝╚══╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝ ╚═╝  ╚═╝╚══════╝╚══════╝${NC}"
     echo -e "               ${WHITE}───  W A T E R W A L L - M A N A G E R  ───${NC}                "
-    echo -e "                            ${YELLOW}${BOLD}Waterwall $(cat "$WW_VER_FILE" 2>/dev/null || echo unknown)${NC}"
+    echo -e "                            ${YELLOW}${BOLD}Waterwall ${ver_label}${NC}"
 }
 
 is_back() {
@@ -158,6 +182,57 @@ get_public_ip() {
 }
 
 # ==============================================================================
+# SYSTEMD TUNNEL SERVICE MANAGEMENT
+# ==============================================================================
+
+install_and_start_tunnel_service() {
+    local cfg_file="$1"
+
+    cat > "$WW_SERVICE_FILE" <<EOF
+[Unit]
+Description=Waterwall-Manager Tunnel Service (${cfg_file})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=${WW_DIR}
+ExecStart=${WW_BIN}
+ExecStopPost=/bin/bash -c 'iptables-save -t raw 2>/dev/null | grep -E "WWRAW_NOTRACK|WWCAP_NOTRACK" | while read -r r; do eval "iptables -t raw \${r/-A/-D}" 2>/dev/null; done'
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload 2>/dev/null
+    systemctl enable "$WW_SERVICE_NAME" >/dev/null 2>&1
+    systemctl restart "$WW_SERVICE_NAME" 2>/dev/null
+    sleep 1
+
+    if systemctl is-active --quiet "$WW_SERVICE_NAME"; then
+        echo -e "${GREEN}[✓] Systemd service '${WW_SERVICE_NAME}' is active and running.${NC}"
+    else
+        echo -e "${RED}[!] Service '${WW_SERVICE_NAME}' failed to stay up. Check logs in Manage Tunnels.${NC}"
+    fi
+}
+
+get_tunnel_service_status() {
+    if [[ ! -f "$WW_SERVICE_FILE" ]]; then
+        echo -e "${YELLOW}Not Created${NC}"
+        return
+    fi
+    if systemctl is-active --quiet "$WW_SERVICE_NAME"; then
+        echo -e "${GREEN}Active (Running)${NC}"
+    else
+        echo -e "${RED}Stopped / Inactive${NC}"
+    fi
+}
+
+# ==============================================================================
 # WATERWALL CORE & SCRIPT INSTALLATION / UPDATE
 # ==============================================================================
 
@@ -175,8 +250,6 @@ detect_compatible_asset() {
 
     case "$arch" in
         x86_64|amd64)
-            # Release has linux builds: clang-avx512f-x64, clang-x64, gcc-x64 and gcc-x64-old-cpu.
-            # Never pick the AVX-512 build unless this CPU really has avx512f (it would crash).
             if grep -q -i "avx512f" /proc/cpuinfo 2>/dev/null; then
                 asset_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("linux.*avx512f.*x64"; "i")) | .browser_download_url' | head -n1)
             fi
@@ -184,7 +257,7 @@ detect_compatible_asset() {
                 if [[ "$has_avx2" == "true" ]]; then
                     asset_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("linux-gcc-x64"; "i")) | select(.name | test("old-cpu"; "i") | not) | .browser_download_url' | head -n1)
                     if [[ -z "$asset_url" || "$asset_url" == "null" ]]; then
-                        asset_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("linux.*x64"; "i")) | select(.name | test("old-cpu|avx512"; "i") | not) | .browser_download_url' | head -n1)
+                        asset_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("linux.*x64"; "i")) | select(.name | test("old-cpu"; "i") | not) | select(.name | test("avx512"; "i") | not) | .browser_download_url' | head -n1)
                     fi
                 else
                     asset_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | test("linux.*x64.*old-cpu"; "i")) | .browser_download_url' | head -n1)
@@ -253,6 +326,12 @@ install_or_update_core() {
         return 1
     fi
 
+    local was_running="false"
+    if systemctl is-active --quiet "$WW_SERVICE_NAME" 2>/dev/null; then
+        was_running="true"
+        systemctl stop "$WW_SERVICE_NAME" 2>/dev/null
+    fi
+
     mv -f "$extracted_bin" "$WW_BIN"
     chmod +x "$WW_BIN"
     setcap cap_net_admin,cap_net_raw+ep "$WW_BIN" 2>/dev/null
@@ -260,13 +339,27 @@ install_or_update_core() {
     rm -rf "$ACTIVE_TMP_DIR"
     ACTIVE_TMP_DIR=""
 
+    if [[ "$was_running" == "true" ]]; then
+        systemctl start "$WW_SERVICE_NAME" 2>/dev/null
+    fi
+
     echo -e "${GREEN}[✓] WaterWall Core (${latest_tag}) installed and given execution permissions at ${WW_BIN}.${NC}"
     sleep 1
     return 0
 }
 
-# Only installs on startup if the binary is completely missing.
-# Does NOT check for updates every time wwmng runs.
+sync_transports() {
+    mkdir -p "$WW_TRANSPORTS_DIR"
+    local t_url="${REPO_RAW_BASE}/transports/bitswapmux.sh"
+    local t_dest="${WW_TRANSPORTS_DIR}/bitswapmux.sh"
+    if curl -fsSL --max-time 8 "$t_url" -o "${t_dest}.tmp" 2>/dev/null && [[ -s "${t_dest}.tmp" ]]; then
+        mv -f "${t_dest}.tmp" "$t_dest"
+        chmod +x "$t_dest"
+    else
+        rm -f "${t_dest}.tmp" 2>/dev/null
+    fi
+}
+
 ensure_core_present_on_startup() {
     if [[ -x "$WW_BIN" ]]; then
         return 0
@@ -316,9 +409,6 @@ def run(cmd):
         return subprocess.CompletedProcess(cmd, 1, "", "")
 
 
-# ----------------------------------------------------------------------------
-# Process + firewall hygiene (RawSocket installs iptables rules while it runs)
-# ----------------------------------------------------------------------------
 def stop_proc(p, grace=6):
     if p is None or p.poll() is not None:
         return
@@ -339,7 +429,6 @@ def stop_proc(p, grace=6):
 
 
 def purge_rules():
-    """Remove only the firewall rules WaterWall's RawSocket may have left behind."""
     removed = 0
     out = run(["iptables-save", "-t", "raw"]).stdout
     for line in out.splitlines():
@@ -372,9 +461,6 @@ signal.signal(signal.SIGINT, on_signal)
 signal.signal(signal.SIGTERM, on_signal)
 
 
-# ----------------------------------------------------------------------------
-# Control channel (plain TCP, newline-delimited JSON + raw bytes for speed test)
-# ----------------------------------------------------------------------------
 class Chan:
     def __init__(self, s):
         self.s = s
@@ -455,9 +541,6 @@ def open_channel():
     return None
 
 
-# ----------------------------------------------------------------------------
-# WaterWall config generation (written next to the core so you can inspect them)
-# ----------------------------------------------------------------------------
 def local_source_ip():
     out = run(["ip", "-4", "route", "get", PEER_IP]).stdout
     m = re.search(r"\bsrc (\d+\.\d+\.\d+\.\d+)", out)
@@ -583,9 +666,6 @@ def parse_report(d):
     return res
 
 
-# ----------------------------------------------------------------------------
-# Test stages
-# ----------------------------------------------------------------------------
 def self_check():
     log(f"{C}[*] Step 1/4: WaterWall core self-check (PacketGenerator -> PacketCounter)...{N}")
     d = write_selfcheck()
@@ -623,7 +703,6 @@ def serve_pings(ch, n=5):
 
 
 def speed_exchange(ch, secs=3):
-    """Returns (tx_mbps this->peer, rx_mbps peer->this), both really measured."""
     if not IS_SERVER:
         ch.send({"cmd": "speed_up"})
         ch.stream_send(secs)
@@ -683,9 +762,6 @@ def run_phase(ch, label, ppi, duration_ms, src_ip, rtt_ms):
     return {"ppi": ppi, "rx_from_peer": mine, "tx_to_peer": theirs}
 
 
-# ----------------------------------------------------------------------------
-# Summary
-# ----------------------------------------------------------------------------
 def pct(phase, key, p):
     if not phase:
         return None
@@ -786,7 +862,6 @@ def summary(p1, p2, tcp, rtt, nat_note):
     log("═" * W)
 
 
-# ----------------------------------------------------------------------------
 def main():
     for tool in ("iptables", "iptables-save", "ip"):
         if not shutil.which(tool):
@@ -834,7 +909,6 @@ def main():
         ch.send({"cmd": "hello_ack"})
         log(f" [i] Test mode chosen by the Iran side: {mode}")
 
-    # step 2: RTT + TCP speed
     if IS_SERVER:
         serve_pings(ch)
         rtt = None
@@ -918,25 +992,71 @@ run_packet_probe() {
 }
 
 # ==============================================================================
-# MENU ACTIONS
+# MENU ACTIONS: CREATE TUNNEL & MANAGE TUNNELS
 # ==============================================================================
+
+load_transport_module() {
+    local transport_name="$1"
+    local local_module="${WW_TRANSPORTS_DIR}/${transport_name}.sh"
+    local repo_module="./transports/${transport_name}.sh"
+    local remote_url="${REPO_RAW_BASE}/transports/${transport_name}.sh"
+
+    if [[ -f "$repo_module" ]]; then
+        cp -f "$repo_module" "$local_module"
+        chmod +x "$local_module"
+    fi
+
+    if [[ ! -f "$local_module" ]]; then
+        echo -e "${CYAN}[*] Downloading transport module 'transports/${transport_name}.sh' from GitHub...${NC}"
+        if ! curl -fsSL --max-time 10 "$remote_url" -o "$local_module" 2>/dev/null; then
+            rm -f "$local_module" 2>/dev/null
+            echo -e "${RED}[!] Could not fetch transports/${transport_name}.sh from GitHub.${NC}"
+            return 1
+        fi
+        if [[ ! -s "$local_module" ]]; then
+            rm -f "$local_module" 2>/dev/null
+            echo -e "${RED}[!] Downloaded transports/${transport_name}.sh is empty.${NC}"
+            return 1
+        fi
+        chmod +x "$local_module"
+    fi
+
+    # shellcheck disable=SC1090
+    source "$local_module"
+    return 0
+}
 
 menu_create_tunnel() {
     while true; do
         print_banner
-        echo -e "${BOLD}${MAGENTA}>>> Create a Tunnel${NC}"
+        echo -e "${BOLD}${MAGENTA}>>> Create a Tunnel (Select Transport)${NC}"
         echo -e "${BLUE}──────────────────────────────────────────────────────────────────────────${NC}"
-        echo -e "${YELLOW}[i] Tunnel creation wizard placeholder (to be configured in the next step).${NC}"
-        echo ""
+        echo -e "  ${GREEN}1)${NC} BitSwapMux  (${CYAN}transports/bitswapmux.sh${NC} - Multi-Port TCP/UDP + TUN + BitSwap)"
         echo -e "  ${CYAN}0)${NC} Back to Main Menu"
-        echo ""
-        read -rp "$(echo -e "${CYAN}Select an option [0]: ${NC}")" choice
-        if is_back "$choice"; then
+        echo -e "${BLUE}──────────────────────────────────────────────────────────────────────────${NC}"
+        read -rp "$(echo -e "${CYAN}Select transport [0-1]: ${NC}")" trans_choice
+
+        if is_back "$trans_choice"; then
             return 0
         fi
-        if [[ -z "$choice" ]]; then
+        if [[ -z "$trans_choice" ]]; then
             return 0
         fi
+
+        case "$trans_choice" in
+            1)
+                if load_transport_module "bitswapmux"; then
+                    run_bitswapmux_wizard
+                    return 0
+                else
+                    pause_back
+                fi
+                ;;
+            *)
+                echo -e "${RED}[!] Invalid selection.${NC}"
+                sleep 1
+                ;;
+        esac
     done
 }
 
@@ -946,37 +1066,147 @@ menu_manage_tunnels() {
         echo -e "${BOLD}${MAGENTA}>>> Manage Tunnels${NC}"
         echo -e "${BLUE}──────────────────────────────────────────────────────────────────────────${NC}"
 
-        local configs=("${WW_DIR}"/*.json)
-        local count=0
-        for cfg in "${configs[@]}"; do
-            if [[ ! -e "$cfg" ]]; then
+        local active_cfg="None"
+        local current_mtu="N/A"
+        if [[ -f "$WW_CORE_JSON" ]]; then
+            active_cfg=$(jq -r '.configs[0] // "None"' "$WW_CORE_JSON" 2>/dev/null)
+            current_mtu=$(jq -r '.misc.mtu // "N/A"' "$WW_CORE_JSON" 2>/dev/null)
+        fi
+
+        echo -e "  * ${BOLD}Service Status${NC} : $(get_tunnel_service_status)"
+        echo -e "  * ${BOLD}Active Config${NC}  : ${YELLOW}${active_cfg}${NC} (MTU: ${current_mtu})"
+        echo -e "  * ${BOLD}Core Path${NC}      : ${CYAN}${WW_CORE_JSON}${NC}"
+        echo -e "${BLUE}──────────────────────────────────────────────────────────────────────────${NC}"
+        echo -e "  ${BOLD}Configured Tunnel JSONs in ${WW_DIR}:${NC}"
+
+        local configs=()
+        local f
+        for f in "${WW_DIR}"/*.json; do
+            if [[ ! -e "$f" ]]; then
                 continue
             fi
             local bname
-            bname=$(basename "$cfg")
+            bname=$(basename "$f")
             if [[ "$bname" == "core.json" ]]; then
                 continue
             fi
-            count=$((count + 1))
-            echo -e "  ${GREEN}${count})${NC} ${bname}"
+            configs+=("$bname")
         done
 
-        if [[ $count -eq 0 ]]; then
-            echo -e "  ${YELLOW}No active tunnel profiles found in ${WW_DIR}.${NC}"
+        if [[ ${#configs[@]} -eq 0 ]]; then
+            echo -e "    ${YELLOW}(No tunnel config JSONs found yet)${NC}"
+        else
+            local c
+            for c in "${configs[@]}"; do
+                if [[ "$c" == "$active_cfg" ]]; then
+                    echo -e "    * ${GREEN}${c}${NC} ${BOLD}[ACTIVE in core.json]${NC} -> ${CYAN}${WW_DIR}/${c}${NC}"
+                else
+                    echo -e "    * ${WHITE}${c}${NC} -> ${CYAN}${WW_DIR}/${c}${NC}"
+                fi
+            done
         fi
 
-        echo ""
+        echo -e "${BLUE}──────────────────────────────────────────────────────────────────────────${NC}"
+        echo -e "  ${GREEN}1)${NC} View Live Tunnel Logs (Press Ctrl+C to exit logs)"
+        echo -e "  ${GREEN}2)${NC} Restart Tunnel Service"
+        echo -e "  ${GREEN}3)${NC} Stop Tunnel Service"
+        echo -e "  ${GREEN}4)${NC} Start Tunnel Service"
+        echo -e "  ${GREEN}5)${NC} Inspect Config & Core JSON Contents"
+        echo -e "  ${RED}6)${NC} Delete Tunnel Config & Stop Service"
         echo -e "  ${CYAN}0)${NC} Back to Main Menu"
-        echo ""
-        read -rp "$(echo -e "${CYAN}Select a config to inspect or '0' to go back: ${NC}")" sub_choice
-        if is_back "$sub_choice"; then
+        echo -e "${BLUE}──────────────────────────────────────────────────────────────────────────${NC}"
+        read -rp "$(echo -e "${CYAN}Select an action [0-6]: ${NC}")" m_choice
+
+        if is_back "$m_choice"; then
             return 0
         fi
-        if [[ -z "$sub_choice" ]]; then
+        if [[ -z "$m_choice" ]]; then
             return 0
         fi
+
+        case "$m_choice" in
+            1)
+                echo ""
+                echo -e "${YELLOW}[i] Showing live WaterWall logs (Press Ctrl+C to return to Manage Tunnels)...${NC}"
+                sleep 1
+                IN_LOG_VIEW="true"
+                if [[ -f "${WW_DIR}/log/core.log" ]]; then
+                    tail -n 40 -f "${WW_DIR}/log/"*.log 2>/dev/null
+                else
+                    journalctl -u "$WW_SERVICE_NAME" -n 50 -f
+                fi
+                IN_LOG_VIEW="false"
+                ;;
+            2)
+                echo -e "${CYAN}[*] Restarting ${WW_SERVICE_NAME}...${NC}"
+                systemctl restart "$WW_SERVICE_NAME" 2>/dev/null
+                sleep 1
+                echo -e "${GREEN}[✓] Status: $(get_tunnel_service_status)${NC}"
+                sleep 1
+                ;;
+            3)
+                echo -e "${CYAN}[*] Stopping ${WW_SERVICE_NAME} and cleaning RawSocket firewall rules...${NC}"
+                systemctl stop "$WW_SERVICE_NAME" 2>/dev/null
+                purge_ww_rules
+                sleep 1
+                echo -e "${GREEN}[✓] Status: $(get_tunnel_service_status)${NC}"
+                sleep 1
+                ;;
+            4)
+                echo -e "${CYAN}[*] Starting ${WW_SERVICE_NAME}...${NC}"
+                systemctl start "$WW_SERVICE_NAME" 2>/dev/null
+                sleep 1
+                echo -e "${GREEN}[✓] Status: $(get_tunnel_service_status)${NC}"
+                sleep 1
+                ;;
+            5)
+                echo ""
+                echo -e "${CYAN}=== ${WW_CORE_JSON} ===${NC}"
+                if [[ -f "$WW_CORE_JSON" ]]; then
+                    cat "$WW_CORE_JSON"
+                else
+                    echo "Not found."
+                fi
+                if [[ "$active_cfg" != "None" && -f "${WW_DIR}/${active_cfg}" ]]; then
+                    echo ""
+                    echo -e "${CYAN}=== ${WW_DIR}/${active_cfg} ===${NC}"
+                    cat "${WW_DIR}/${active_cfg}"
+                fi
+                pause_back
+                ;;
+            6)
+                if [[ ${#configs[@]} -eq 0 ]]; then
+                    echo -e "${YELLOW}[!] No tunnel configs to delete.${NC}"
+                    sleep 1
+                    continue
+                fi
+                echo ""
+                read -rp "$(echo -e "${RED}Stop tunnel service and delete '${active_cfg}'? Type 'yes' to confirm: ${NC}")" del_ok
+                if [[ "${del_ok,,}" == "yes" ]]; then
+                    systemctl stop "$WW_SERVICE_NAME" 2>/dev/null
+                    systemctl disable "$WW_SERVICE_NAME" 2>/dev/null
+                    rm -f "$WW_SERVICE_FILE"
+                    systemctl daemon-reload 2>/dev/null
+                    purge_ww_rules
+                    if [[ "$active_cfg" != "None" && -f "${WW_DIR}/${active_cfg}" ]]; then
+                        rm -f "${WW_DIR}/${active_cfg}"
+                    fi
+                    rm -f "$WW_CORE_JSON"
+                    echo -e "${GREEN}[✓] Tunnel stopped and config deleted.${NC}"
+                    sleep 1
+                fi
+                ;;
+            *)
+                echo -e "${RED}[!] Invalid option.${NC}"
+                sleep 1
+                ;;
+        esac
     done
 }
+
+# ==============================================================================
+# PACKET TESTER, UPDATE & UNINSTALL MENUS
+# ==============================================================================
 
 menu_packet_tester() {
     while true; do
@@ -1055,7 +1285,7 @@ menu_packet_tester() {
 menu_update() {
     while true; do
         print_banner
-        echo -e "${BOLD}${MAGENTA}>>> Check & Update (Script + WaterWall Core)${NC}"
+        echo -e "${BOLD}${MAGENTA}>>> Check & Update (Script + Transports + WaterWall Core)${NC}"
         echo -e "${BLUE}──────────────────────────────────────────────────────────────────────────${NC}"
         echo -e "${CYAN}[*] Checking GitHub for script and WaterWall Core updates...${NC}"
         echo ""
@@ -1095,13 +1325,14 @@ menu_update() {
             latest_core_tag=$(echo "$release_json" | jq -r '.tag_name // empty')
             if [[ -n "$latest_core_tag" ]]; then
                 core_check_ok="true"
-                if [[ ! -x "$WW_BIN" || "$installed_core_tag" != "$latest_core_tag" ]]; then
+                if [[ ! -x "$WW_BIN" ]]; then
+                    core_needs_update="true"
+                elif [[ "$installed_core_tag" != "$latest_core_tag" ]]; then
                     core_needs_update="true"
                 fi
             fi
         fi
 
-        # Display status summary
         if [[ "$script_check_ok" == "true" ]]; then
             if [[ "$script_needs_update" == "true" ]]; then
                 echo -e "  * ${BOLD}Waterwall-Manager (wwmng)${NC} : ${YELLOW}Update available${NC} (${local_hash:0:7} -> ${remote_hash:0:7})"
@@ -1127,11 +1358,16 @@ menu_update() {
         if [[ "$script_needs_update" == "false" && "$core_needs_update" == "false" ]]; then
             echo -e "${GREEN}[✓] Both Waterwall-Manager and WaterWall Core are already on the latest version.${NC}"
             echo ""
-            echo -e "  ${GREEN}1)${NC} Force Re-install Both (Script + Core)"
+            echo -e "  ${GREEN}1)${NC} Force Re-install Both (Script + Transports + Core)"
             echo -e "  ${CYAN}0)${NC} Back to Main Menu"
             echo ""
             read -rp "$(echo -e "${CYAN}Select an option [0-1]: ${NC}")" up_choice
-            if is_back "$up_choice" || [[ -z "$up_choice" ]]; then
+            if is_back "$up_choice"; then
+                rm -rf "$ACTIVE_TMP_DIR"
+                ACTIVE_TMP_DIR=""
+                return 0
+            fi
+            if [[ -z "$up_choice" ]]; then
                 rm -rf "$ACTIVE_TMP_DIR"
                 ACTIVE_TMP_DIR=""
                 return 0
@@ -1150,7 +1386,12 @@ menu_update() {
             echo -e "  ${CYAN}0)${NC} No, go back"
             echo ""
             read -rp "$(echo -e "${CYAN}Select an option [0-1]: ${NC}")" confirm_up
-            if is_back "$confirm_up" || [[ "$confirm_up" != "1" ]]; then
+            if is_back "$confirm_up"; then
+                rm -rf "$ACTIVE_TMP_DIR"
+                ACTIVE_TMP_DIR=""
+                return 0
+            fi
+            if [[ "$confirm_up" != "1" ]]; then
                 rm -rf "$ACTIVE_TMP_DIR"
                 ACTIVE_TMP_DIR=""
                 return 0
@@ -1160,11 +1401,13 @@ menu_update() {
         echo ""
         local restart_needed="false"
 
+        sync_transports
+
         if [[ "$script_needs_update" == "true" && "$script_check_ok" == "true" ]]; then
             echo -e "${CYAN}[*] Updating Waterwall-Manager script (${WWMNG_BIN})...${NC}"
             cp -f "$remote_script" "$WWMNG_BIN"
             chmod +x "$WWMNG_BIN"
-            echo -e "${GREEN}[✓] Waterwall-Manager script updated successfully.${NC}"
+            echo -e "${GREEN}[✓] Waterwall-Manager script and transports updated.${NC}"
             restart_needed="true"
         fi
 
@@ -1191,8 +1434,9 @@ menu_uninstall() {
     echo -e "${BOLD}${RED}>>> Complete Uninstall (Waterwall-Manager + WaterWall Core + All Tunnels)${NC}"
     echo -e "${BLUE}──────────────────────────────────────────────────────────────────────────${NC}"
     echo -e "${YELLOW}This will permanently remove:${NC}"
-    echo -e "  * All running WaterWall processes and systemd tunnel services"
-    echo -e "  * WaterWall Core binary, configs, logs, and probes in ${BOLD}${WW_DIR}${NC}"
+    echo -e "  * Active tunnel services (${WW_SERVICE_NAME}) and running WaterWall processes"
+    echo -e "  * All RawSocket firewall rules installed by WaterWall"
+    echo -e "  * WaterWall Core binary, transports, tunnel configs, and logs in ${BOLD}${WW_DIR}${NC}"
     echo -e "  * The global ${BOLD}wwmng${NC} command at ${BOLD}${WWMNG_BIN}${NC}"
     echo ""
     echo -e "  ${RED}yes)${NC} Confirm Complete Uninstall"
@@ -1212,13 +1456,7 @@ menu_uninstall() {
     fi
 
     echo ""
-    echo -e "${CYAN}[*] Stopping running WaterWall processes...${NC}"
-    pkill -TERM -f "${WW_BIN}" 2>/dev/null
-    sleep 2
-    pkill -9 -f "${WW_BIN}" 2>/dev/null
-    purge_ww_rules
-
-    echo -e "${CYAN}[*] Stopping and removing any Waterwall-Manager / WaterWall systemd services...${NC}"
+    echo -e "${CYAN}[*] Stopping and removing all tunnel systemd services...${NC}"
     for svc in /etc/systemd/system/wwmng*.service /etc/systemd/system/waterwall*.service /etc/systemd/system/astro-tun*.service; do
         if [[ ! -e "$svc" ]]; then
             continue
@@ -1230,6 +1468,12 @@ menu_uninstall() {
         rm -f "$svc"
     done
     systemctl daemon-reload 2>/dev/null
+
+    echo -e "${CYAN}[*] Stopping running WaterWall processes and cleaning firewall rules...${NC}"
+    pkill -TERM -f "${WW_BIN}" 2>/dev/null
+    sleep 1
+    pkill -9 -f "${WW_BIN}" 2>/dev/null
+    purge_ww_rules
 
     echo -e "${CYAN}[*] Removing installation directories (${WW_DIR} & legacy /opt/astro-tun)...${NC}"
     rm -rf "${WW_DIR}" /opt/astro-tun
