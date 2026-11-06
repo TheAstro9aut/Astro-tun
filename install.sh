@@ -14,7 +14,9 @@ NC='\033[0m'
 
 cleanup_install() {
     echo -e "\n${RED}[!] Installation interrupted by user (Ctrl+C). Rolling back...${NC}"
-    [[ -n "$TMP_DL" && -f "$TMP_DL" ]] && rm -f "$TMP_DL"
+    if [[ -n "$TMP_DL" && -f "$TMP_DL" ]]; then
+        rm -f "$TMP_DL"
+    fi
     exit 130
 }
 trap cleanup_install INT TERM
@@ -24,17 +26,17 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# Clean up legacy astro-tun binary if present
-rm -f /usr/local/bin/astro-tun 2>/dev/null || true
+rm -f /usr/local/bin/astro-tun 2>/dev/null
 
 echo -e "${CYAN}[*] Installing required system packages...${NC}"
+# iptables is required by WaterWall's RawSocket node (packet tester and raw tunnels).
 if command -v apt-get &>/dev/null; then
     apt-get update -y -qq
-    apt-get install -y -qq curl wget unzip jq socat iproute2 netcat-openbsd bc python3 libcap2-bin >/dev/null 2>&1
+    apt-get install -y -qq curl wget unzip jq socat iproute2 iptables netcat-openbsd bc python3 libcap2-bin >/dev/null 2>&1
 elif command -v dnf &>/dev/null; then
-    dnf install -y -q curl wget unzip jq socat iproute nmap-ncat bc python3 libcap >/dev/null 2>&1
+    dnf install -y -q curl wget unzip jq socat iproute iptables nmap-ncat bc python3 libcap >/dev/null 2>&1
 elif command -v pacman &>/dev/null; then
-    pacman -Sy --noconfirm --needed curl wget unzip jq socat iproute2 openbsd-netcat bc python libcap >/dev/null 2>&1
+    pacman -Sy --noconfirm --needed curl wget unzip jq socat iproute2 iptables openbsd-netcat bc python libcap >/dev/null 2>&1
 fi
 
 mkdir -p "$INSTALL_DIR"/{log,libs,configs,results}
@@ -47,7 +49,6 @@ else
     curl -fsSL "$REPO_RAW_URL/wwmng.sh" -o "$TMP_DL"
     mv -f "$TMP_DL" "$BIN_PATH"
 fi
-
 chmod +x "$BIN_PATH"
 
 echo -e "${GREEN}[✓] Waterwall-Manager installed! Run it anytime by typing: wwmng${NC}"
