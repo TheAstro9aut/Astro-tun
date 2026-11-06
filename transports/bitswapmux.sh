@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 
 # ==============================================================================
-# Transport Module: BitSwapMux (Multi-Port TCP & UDP + TUN + XOR + BitSwap + Raw)
+# Transport Module: BitSwapMux
 # Loaded by: /usr/local/bin/wwmng
 # ==============================================================================
 
-VALID_TCP_BITS=("syn" "psh" "rst" "ack" "fin" "urg" "ece" "cwr")
+VALID_SWAP_BITS=("syn" "rst" "cwr" "ack" "fin" "urg" "ece")
 
-is_valid_tcp_bit() {
+is_valid_swap_bit() {
     local candidate="${1,,}"
     local b
-    for b in "${VALID_TCP_BITS[@]}"; do
+    for b in "${VALID_SWAP_BITS[@]}"; do
         if [[ "$b" == "$candidate" ]]; then
             return 0
         fi
@@ -26,9 +26,9 @@ prompt_yes_no() {
 
     while true; do
         if [[ "$default_ans" == "Y" ]]; then
-            read -rp "$(echo -e "${CYAN}${prompt_text} [${GREEN}Y/n${CYAN}] (or '0' to go back): ${NC}")" reply
+            read -rp "$(echo -e "${CYAN}${prompt_text} [${GREEN}Y/n${CYAN}]: ${NC}")" reply
         else
-            read -rp "$(echo -e "${CYAN}${prompt_text} [${GREEN}y/N${CYAN}] (or '0' to go back): ${NC}")" reply
+            read -rp "$(echo -e "${CYAN}${prompt_text} [${GREEN}y/N${CYAN}]: ${NC}")" reply
         fi
 
         if is_back "$reply"; then
@@ -55,7 +55,6 @@ prompt_yes_no() {
     done
 }
 
-# Formats "60627, 48843, 2096" or "60627 48843 2096" into "[60627, 48843, 2096]"
 format_port_array() {
     local raw="$1"
     local cleaned
@@ -84,44 +83,22 @@ format_port_array() {
     return 0
 }
 
-prompt_bit_pair() {
-    local direction_label="$1"
-    local def_bit1="$2"
-    local def_bit2="$3"
-    local out_bit1="$4"
-    local out_bit2="$5"
-    local b1=""
-    local b2=""
+prompt_psh_swap_bit() {
+    local prompt_label="$1"
+    local def_bit="$2"
+    local out_var="$3"
+    local chosen=""
 
     while true; do
-        echo ""
-        echo -e "${BOLD}${WHITE}Configure ${direction_label}:${NC}"
-        echo -e "  Valid TCP flags in WaterWall: ${GREEN}syn, psh, rst, ack, fin, urg, ece, cwr${NC}"
-        if ! prompt_input "  First TCP bit" "$def_bit1" b1; then
+        if ! prompt_input "$prompt_label" "$def_bit" chosen; then
             return 1
         fi
-        b1="${b1,,}"
-        if ! is_valid_tcp_bit "$b1"; then
-            echo -e "${RED}  [!] Invalid TCP bit '${b1}'. Choose from: syn, psh, rst, ack, fin, urg, ece, cwr${NC}"
+        chosen="${chosen,,}"
+        if ! is_valid_swap_bit "$chosen"; then
+            echo -e "${RED}[!] Invalid TCP bit '${chosen}'. Choose from: syn, rst, cwr, ack, fin, urg, ece${NC}"
             continue
         fi
-
-        if ! prompt_input "  Second TCP bit to swap with '${b1}'" "$def_bit2" b2; then
-            return 1
-        fi
-        b2="${b2,,}"
-        if ! is_valid_tcp_bit "$b2"; then
-            echo -e "${RED}  [!] Invalid TCP bit '${b2}'. Choose from: syn, psh, rst, ack, fin, urg, ece, cwr${NC}"
-            continue
-        fi
-
-        if [[ "$b1" == "$b2" ]]; then
-            echo -e "${RED}  [!] The two TCP bits must be different to swap them (e.g., psh and syn).${NC}"
-            continue
-        fi
-
-        printf -v "$out_bit1" '%s' "$b1"
-        printf -v "$out_bit2" '%s' "$b2"
+        printf -v "$out_var" '%s' "$chosen"
         return 0
     done
 }
@@ -138,10 +115,8 @@ write_bitswapmux_configs() {
     local xor_key="$9"
     local cfg_file="${10}"
     local mtu_val="${11}"
-    local up_b1="${12}"
-    local up_b2="${13}"
-    local dw_b1="${14}"
-    local dw_b2="${15}"
+    local up_bit="${12}"
+    local dw_bit="${13}"
 
     local cfg_path="${WW_DIR}/${cfg_file}"
     ROLLBACK_FILES=("$cfg_path" "$WW_CORE_JSON")
@@ -294,8 +269,8 @@ write_bitswapmux_configs() {
             "name": "ip-manipulator-up",
             "type": "IpManipulator",
             "settings": {
-                "up-tcp-bit-${up_b1}": "packet->${up_b2}",
-                "up-tcp-bit-${up_b2}": "packet->${up_b1}"
+                "up-tcp-bit-psh": "packet->${up_bit}",
+                "up-tcp-bit-${up_bit}": "packet->psh"
             },
             "next": "rd"
         },
@@ -321,8 +296,8 @@ write_bitswapmux_configs() {
             "name": "ip-manipulator",
             "type": "IpManipulator",
             "settings": {
-                "dw-tcp-bit-${dw_b1}": "packet->${dw_b2}",
-                "dw-tcp-bit-${dw_b2}": "packet->${dw_b1}"
+                "dw-tcp-bit-psh": "packet->${dw_bit}",
+                "dw-tcp-bit-${dw_bit}": "packet->psh"
             },
             "next": "rd2"
         },
@@ -340,7 +315,7 @@ EOF
     else
         cat > "$cfg_path" <<EOF
 {
-  "name": "foreign-tcp-bitswap-mux",
+  "name": "kharej-tcp-bitswap-mux",
   "variables": {
     "ip_server_iran": "${iran_ip}",
     "ip_server_kharej": "${kharej_ip}",
@@ -473,8 +448,8 @@ EOF
       "name": "ip-manipulator-in",
       "type": "IpManipulator",
       "settings": {
-        "dw-tcp-bit-${dw_b1}": "packet->${dw_b2}",
-        "dw-tcp-bit-${dw_b2}": "packet->${dw_b1}"
+        "dw-tcp-bit-psh": "packet->${dw_bit}",
+        "dw-tcp-bit-${dw_bit}": "packet->psh"
       },
       "next": "rdin"
     },
@@ -533,8 +508,8 @@ EOF
       "name": "ip-manipulator",
       "type": "IpManipulator",
       "settings": {
-        "up-tcp-bit-${up_b1}": "packet->${up_b2}",
-        "up-tcp-bit-${up_b2}": "packet->${up_b1}"
+        "up-tcp-bit-psh": "packet->${up_bit}",
+        "up-tcp-bit-${up_bit}": "packet->psh"
       },
       "next": "rd"
     },
@@ -551,7 +526,6 @@ EOF
 EOF
     fi
 
-    # Write core.json matching your exact template
     cat > "$WW_CORE_JSON" <<EOF
 {
     "log": {
@@ -597,11 +571,11 @@ EOF
 run_bitswapmux_wizard() {
     while true; do
         print_banner
-        echo -e "${BOLD}${MAGENTA}>>> Create Tunnel: BitSwapMux (Multi-Port TCP + UDP + TUN + XOR + BitSwap)${NC}"
+        echo -e "${BOLD}${MAGENTA}>>> Create Tunnel: BitSwapMux${NC}"
         echo -e "${BLUE}──────────────────────────────────────────────────────────────────────────${NC}"
         echo -e "Select this server's role:"
-        echo -e "  ${GREEN}1)${NC} Iran            (Default config: ${BOLD}config_iran.json${NC})"
-        echo -e "  ${GREEN}2)${NC} Foreign / Kharej (Default config: ${BOLD}config_kharej.json${NC})"
+        echo -e "  ${GREEN}1)${NC} Iran"
+        echo -e "  ${GREEN}2)${NC} Kharej"
         echo -e "  ${CYAN}0)${NC} Back"
         echo ""
         read -rp "$(echo -e "${CYAN}Select server role [0-2]: ${NC}")" role_opt
@@ -611,15 +585,15 @@ run_bitswapmux_wizard() {
         fi
 
         local role=""
-        local default_cfg=""
+        local cfg_file=""
         case "$role_opt" in
             1)
                 role="iran"
-                default_cfg="config_iran.json"
+                cfg_file="config_iran.json"
                 ;;
             2)
                 role="kharej"
-                default_cfg="config_kharej.json"
+                cfg_file="config_kharej.json"
                 ;;
             *)
                 echo -e "${RED}[!] Invalid option. Please select 1, 2, or 0.${NC}"
@@ -639,24 +613,28 @@ run_bitswapmux_wizard() {
         local mux_conns="8"
         local final_ip="127.0.0.1"
         local xor_key="90"
-        local use_def_cfg=""
-        local cfg_file=""
-        local use_def_mtu=""
         local mtu_val="1400"
 
         echo ""
+        echo -e "${YELLOW}Press 0 to go back anytime.${NC}"
+        echo -e "${BLUE}──────────────────────────────────────────────────────────────────────────${NC}"
+
         if [[ "$role" == "iran" ]]; then
             if ! prompt_input "Enter Iran Server Public IP (THIS server)" "$detected_ip" iran_ip; then
                 continue
             fi
-            if ! prompt_input "Enter Foreign (Kharej) Server Public IP" "" kharej_ip; then
+            if ! prompt_input "Enter Kharej Server Public IP" "" kharej_ip; then
+                continue
+            fi
+            if ! prompt_input "Enter TCP Mux Transport Port (port_tcp_mux)" "44431" port_tcp_mux; then
+                continue
+            fi
+            if ! prompt_input "Enter UDP Mux Transport Port (port_udp_mux)" "44432" port_udp_mux; then
                 continue
             fi
 
             while true; do
-                echo ""
-                echo -e "${YELLOW}[i] Enter one or multiple user inbound ports (carries both TCP & UDP).${NC}"
-                if ! prompt_input "Tunneled Ports (comma-separated, e.g. 60627, 48843, 2096)" "60627, 48843, 2096" raw_ports; then
+                if ! prompt_input "Inbound Ports (comma-separated, e.g. 443, 2096)" "443" raw_ports; then
                     ports_json_array=""
                     break
                 fi
@@ -670,99 +648,57 @@ run_bitswapmux_wizard() {
                 continue
             fi
 
-            echo ""
-            echo -e "${YELLOW}[i] WaterWall-to-WaterWall internal Mux ports (must match Foreign server & not be used by Xray/SS):${NC}"
-            if ! prompt_input "Enter TCP Mux Transport Port (port_tcp_mux)" "44431" port_tcp_mux; then
-                continue
-            fi
-            if ! prompt_input "Enter UDP Mux Transport Port (port_udp_mux)" "44432" port_udp_mux; then
-                continue
-            fi
-            if ! prompt_input "Enter Mux connections per worker (each_worker_mux_connections_count)" "8" mux_conns; then
+            if ! prompt_input "Enter Mux connections per worker" "8" mux_conns; then
                 continue
             fi
         else
-            if ! prompt_input "Enter Foreign (Kharej) Server Public IP (THIS server)" "$detected_ip" kharej_ip; then
+            if ! prompt_input "Enter Kharej Server Public IP (THIS server)" "$detected_ip" kharej_ip; then
                 continue
             fi
             if ! prompt_input "Enter Iran Server Public IP" "" iran_ip; then
                 continue
             fi
-
-            echo ""
-            echo -e "${YELLOW}[i] WaterWall-to-WaterWall internal Mux ports (must match Iran server & not be used by Xray/SS):${NC}"
             if ! prompt_input "Enter TCP Mux Transport Port (port_tcp_mux)" "44431" port_tcp_mux; then
                 continue
             fi
             if ! prompt_input "Enter UDP Mux Transport Port (port_udp_mux)" "44432" port_udp_mux; then
                 continue
             fi
-            echo ""
-            echo -e "${YELLOW}[i] All tunneled TCP & UDP ports from Iran are restored automatically via HeaderServer and sent to final_ip.${NC}"
-            if ! prompt_input "Enter Local Target IP on Foreign Server (final_ip)" "127.0.0.1" final_ip; then
+            if ! prompt_input "Enter Local Target IP on Kharej Server (final_ip)" "127.0.0.1" final_ip; then
                 continue
             fi
         fi
 
-        echo ""
         if ! prompt_input "Enter Obfuscator XOR Key (0-255, must match on both servers)" "90" xor_key; then
             continue
         fi
 
-        # Config file name with default (Y/n)
-        echo ""
-        if ! prompt_yes_no "Use default tunnel config filename '${default_cfg}'?" "Y" use_def_cfg; then
+        if ! prompt_input "MTU in core.json and TunDevice?" "1400" mtu_val; then
             continue
         fi
-        if [[ "$use_def_cfg" == "yes" ]]; then
-            cfg_file="$default_cfg"
-        else
-            if ! prompt_input "Enter custom tunnel config filename" "$default_cfg" cfg_file; then
-                continue
-            fi
-            if [[ "$cfg_file" != *.json ]]; then
-                cfg_file="${cfg_file}.json"
-            fi
-        fi
 
-        # MTU for core.json & TunDevice with default (Y/n) of 1400
-        echo ""
-        if ! prompt_yes_no "Use default MTU of 1400 in core.json and TunDevice?" "Y" use_def_mtu; then
-            continue
-        fi
-        if [[ "$use_def_mtu" == "yes" ]]; then
-            mtu_val="1400"
-        else
-            if ! prompt_input "Enter custom MTU (e.g. 1350 - 1500)" "1350" mtu_val; then
-                continue
-            fi
-        fi
-
-        # TCP Bit Swap configuration for UP and DW
         echo ""
         echo -e "${BLUE}──────────────────────────────────────────────────────────────────────────${NC}"
-        echo -e "${YELLOW}${BOLD}[!] TCP BIT-SWAP PAIRING RULE (MUST MATCH ACROSS IRAN & FOREIGN):${NC}"
-        echo -e "${YELLOW}    * Iran UP bits (Iran -> Foreign)  MUST equal  Foreign DW bits (ip-manipulator-in)${NC}"
-        echo -e "${YELLOW}    * Iran DW bits (Foreign -> Iran)  MUST equal  Foreign UP bits (ip-manipulator)${NC}"
+        echo -e "${YELLOW}${BOLD}[!] TCP BIT-SWAP NOTE (psh <-> chosen bit):${NC}"
+        echo -e "${YELLOW}    * Iran UP bit MUST equal Kharej DW bit  |  Iran DW bit MUST equal Kharej UP bit${NC}"
+        echo -e "    Valid TCP bits to swap with psh: ${GREEN}syn, rst, cwr, ack, fin, urg, ece${NC}"
         echo -e "${BLUE}──────────────────────────────────────────────────────────────────────────${NC}"
 
-        local up_b1=""
-        local up_b2=""
-        local dw_b1=""
-        local dw_b2=""
+        local up_bit=""
+        local dw_bit=""
 
         if [[ "$role" == "iran" ]]; then
-            if ! prompt_bit_pair "Iran UP Bits (up-tcp-bit in ip-manipulator-up, must match Foreign DW)" "psh" "syn" up_b1 up_b2; then
+            if ! prompt_psh_swap_bit "Enter UP TCP bit to swap with psh (must match Kharej DW)" "syn" up_bit; then
                 continue
             fi
-            if ! prompt_bit_pair "Iran DW Bits (dw-tcp-bit in ip-manipulator, must match Foreign UP)" "psh" "rst" dw_b1 dw_b2; then
+            if ! prompt_psh_swap_bit "Enter DW TCP bit to swap with psh (must match Kharej UP)" "rst" dw_bit; then
                 continue
             fi
         else
-            if ! prompt_bit_pair "Foreign DW Bits (dw-tcp-bit in ip-manipulator-in, must match Iran UP)" "psh" "syn" dw_b1 dw_b2; then
+            if ! prompt_psh_swap_bit "Enter DW TCP bit to swap with psh (must match Iran UP)" "syn" dw_bit; then
                 continue
             fi
-            if ! prompt_bit_pair "Foreign UP Bits (up-tcp-bit in ip-manipulator, must match Iran DW)" "psh" "rst" up_b1 up_b2; then
+            if ! prompt_psh_swap_bit "Enter UP TCP bit to swap with psh (must match Iran DW)" "rst" up_bit; then
                 continue
             fi
         fi
@@ -771,22 +707,22 @@ run_bitswapmux_wizard() {
         print_banner
         echo -e "${BOLD}${MAGENTA}>>> Confirm Tunnel Configuration${NC}"
         echo -e "${BLUE}──────────────────────────────────────────────────────────────────────────${NC}"
-        echo -e "  * ${BOLD}Transport${NC}          : ${GREEN}BitSwapMux (Multi-Port TCP + UDP)${NC}"
+        echo -e "  * ${BOLD}Transport${NC}          : ${GREEN}BitSwapMux${NC}"
         echo -e "  * ${BOLD}Server Role${NC}        : ${GREEN}${role^^}${NC}"
         echo -e "  * ${BOLD}Iran Server IP${NC}     : ${CYAN}${iran_ip}${NC}"
-        echo -e "  * ${BOLD}Foreign Server IP${NC}  : ${CYAN}${kharej_ip}${NC}"
+        echo -e "  * ${BOLD}Kharej Server IP${NC}   : ${CYAN}${kharej_ip}${NC}"
+        echo -e "  * ${BOLD}Mux Ports (TCP/UDP)${NC}: ${CYAN}${port_tcp_mux} / ${port_udp_mux}${NC}"
         if [[ "$role" == "iran" ]]; then
-            echo -e "  * ${BOLD}Inbound TCP/UDP${NC}    : ${CYAN}${ports_json_array}${NC}"
+            echo -e "  * ${BOLD}Inbound Ports${NC}      : ${CYAN}${ports_json_array}${NC}"
             echo -e "  * ${BOLD}Mux Per Worker${NC}     : ${CYAN}${mux_conns}${NC}"
         else
-            echo -e "  * ${BOLD}Target final_ip${NC}    : ${CYAN}${final_ip}${NC} (auto-restores all ports via HeaderServer)"
+            echo -e "  * ${BOLD}Target final_ip${NC}    : ${CYAN}${final_ip}${NC}"
         fi
-        echo -e "  * ${BOLD}Mux Ports (TCP/UDP)${NC}: ${CYAN}${port_tcp_mux} / ${port_udp_mux}${NC}"
         echo -e "  * ${BOLD}XOR Obfuscator Key${NC} : ${CYAN}${xor_key}${NC}"
-        echo -e "  * ${BOLD}Tunnel Config Name${NC} : ${YELLOW}${cfg_file}${NC} (referenced in core.json)"
+        echo -e "  * ${BOLD}Tunnel Config Name${NC} : ${YELLOW}${cfg_file}${NC}"
         echo -e "  * ${BOLD}MTU (Core & TUN)${NC}   : ${YELLOW}${mtu_val}${NC}"
-        echo -e "  * ${BOLD}UP TCP Bit-Swap${NC}    : ${GREEN}\"up-tcp-bit-${up_b1}\": \"packet->${up_b2}\"${NC}, ${GREEN}\"up-tcp-bit-${up_b2}\": \"packet->${up_b1}\"${NC}"
-        echo -e "  * ${BOLD}DW TCP Bit-Swap${NC}    : ${GREEN}\"dw-tcp-bit-${dw_b1}\": \"packet->${dw_b2}\"${NC}, ${GREEN}\"dw-tcp-bit-${dw_b2}\": \"packet->${dw_b1}\"${NC}"
+        echo -e "  * ${BOLD}UP TCP Bit-Swap${NC}    : ${GREEN}\"up-tcp-bit-psh\": \"packet->${up_bit}\"${NC}, ${GREEN}\"up-tcp-bit-${up_bit}\": \"packet->psh\"${NC}"
+        echo -e "  * ${BOLD}DW TCP Bit-Swap${NC}    : ${GREEN}\"dw-tcp-bit-psh\": \"packet->${dw_bit}\"${NC}, ${GREEN}\"dw-tcp-bit-${dw_bit}\": \"packet->psh\"${NC}"
         echo -e "${BLUE}──────────────────────────────────────────────────────────────────────────${NC}"
 
         local confirm_create=""
@@ -806,7 +742,7 @@ run_bitswapmux_wizard() {
             "$role" "$iran_ip" "$kharej_ip" "$ports_json_array" \
             "$port_tcp_mux" "$port_udp_mux" "$mux_conns" "$final_ip" \
             "$xor_key" "$cfg_file" "$mtu_val" \
-            "$up_b1" "$up_b2" "$dw_b1" "$dw_b2"
+            "$up_bit" "$dw_bit"
 
         echo -e "${CYAN}[*] Installing and starting systemd service (${WW_SERVICE_NAME})...${NC}"
         install_and_start_tunnel_service "$cfg_file"
