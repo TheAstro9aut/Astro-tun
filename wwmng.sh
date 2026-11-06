@@ -11,6 +11,7 @@ WW_BIN="${WW_DIR}/Waterwall"
 WW_VER_FILE="${WW_DIR}/.version"
 WW_CORE_JSON="${WW_DIR}/core.json"
 WWMNG_BIN="/usr/local/bin/wwmng"
+WWMNG_RAW_URL="https://raw.githubusercontent.com/TheAstro9aut/Waterwall-Manager/main/wwmng.sh"
 WW_REPO="radkesvat/WaterWall"
 WW_API_LATEST="https://api.github.com/repos/${WW_REPO}/releases/latest"
 
@@ -157,7 +158,7 @@ get_public_ip() {
 }
 
 # ==============================================================================
-# WATERWALL CORE DETECTION, INSTALLATION & UPDATE
+# WATERWALL CORE & SCRIPT INSTALLATION / UPDATE
 # ==============================================================================
 
 detect_compatible_asset() {
@@ -206,41 +207,20 @@ detect_compatible_asset() {
     echo "$asset_url"
 }
 
-check_and_install_core() {
-    local force_update="${1:-false}"
-    echo -e "${CYAN}[*] Checking WaterWall Core status...${NC}"
-
-    local release_json
-    release_json=$(curl -fsSL --max-time 10 "$WW_API_LATEST" 2>/dev/null)
+install_or_update_core() {
+    local release_json="$1"
 
     if [[ -z "$release_json" ]]; then
-        if [[ -x "$WW_BIN" ]]; then
-            echo -e "${YELLOW}[!] Could not reach GitHub API, but WaterWall Core is already installed locally.${NC}"
-            return 0
-        else
-            echo -e "${RED}[!] Failed to fetch latest release metadata from GitHub (${WW_REPO}). Check network connection.${NC}"
-            return 1
-        fi
+        release_json=$(curl -fsSL --max-time 10 "$WW_API_LATEST" 2>/dev/null)
+    fi
+
+    if [[ -z "$release_json" ]]; then
+        echo -e "${RED}[!] Failed to fetch release metadata from GitHub (${WW_REPO}). Check network connection.${NC}"
+        return 1
     fi
 
     local latest_tag
     latest_tag=$(echo "$release_json" | jq -r '.tag_name // empty')
-    local installed_tag=""
-    if [[ -f "$WW_VER_FILE" ]]; then
-        installed_tag=$(cat "$WW_VER_FILE")
-    fi
-
-    if [[ -x "$WW_BIN" && "$installed_tag" == "$latest_tag" && "$force_update" != "true" ]]; then
-        echo -e "${GREEN}[✓] WaterWall Core is installed and on the latest version (${BOLD}${latest_tag}${NC}${GREEN}).${NC}"
-        sleep 1
-        return 0
-    fi
-
-    if [[ ! -x "$WW_BIN" ]]; then
-        echo -e "${YELLOW}[!] WaterWall Core not found. Downloading latest version (${latest_tag})...${NC}"
-    else
-        echo -e "${YELLOW}[*] Updating WaterWall Core (${installed_tag:-unknown} -> ${latest_tag})...${NC}"
-    fi
 
     local asset_url
     asset_url=$(detect_compatible_asset "$release_json")
@@ -252,7 +232,7 @@ check_and_install_core() {
 
     local asset_filename
     asset_filename=$(basename "$asset_url")
-    echo -e "${CYAN}[*] Selected compatible build: ${BOLD}${asset_filename}${NC}"
+    echo -e "${CYAN}[*] Downloading compatible WaterWall Core build: ${BOLD}${asset_filename}${NC} (${latest_tag})..."
 
     ACTIVE_TMP_DIR=$(mktemp -d)
     if ! curl -fL --progress-bar "$asset_url" -o "${ACTIVE_TMP_DIR}/waterwall.zip"; then
@@ -285,15 +265,19 @@ check_and_install_core() {
     return 0
 }
 
+# Only installs on startup if the binary is completely missing.
+# Does NOT check for updates every time wwmng runs.
+ensure_core_present_on_startup() {
+    if [[ -x "$WW_BIN" ]]; then
+        return 0
+    fi
+    echo -e "${YELLOW}[!] WaterWall Core is not installed yet. Installing latest version...${NC}"
+    install_or_update_core ""
+}
+
 # ==============================================================================
 # PACKET TESTER (WaterWall PacketGenerator -> RawSocket / RawSocket -> PacketCounter)
 # ==============================================================================
-# The tester is a small python orchestrator that:
-#   * writes core.json + config_probe_tx.json + config_probe_rx.json under ${WW_DIR}/probe/
-#   * starts the real WaterWall core on both servers (receiver first, then sender)
-#   * sends one probe packet burst for every IP protocol number 0-254 in BOTH directions
-#   * reads WaterWall's own PacketCounter report on each side and merges them
-# Your main core.json is never touched.
 
 PROBE_PY="${WW_DIR}/wwprobe.py"
 PROBE_DIR="${WW_DIR}/probe"
@@ -615,7 +599,7 @@ def self_check():
         log(R_ + " [!] This WaterWall build did not run the packet-test nodes correctly." + N)
         for l in fatal_lines(d):
             log("     " + l)
-        log("     Try menu option 4 (Update Core), then run the Packet Tester again.")
+        log("     Try menu option 4 (Update), then run the Packet Tester again.")
         return False
     log(G + " [✓] Core OK: PacketGenerator / PacketCounter / RawSocket nodes are available." + N)
     return True
@@ -629,7 +613,6 @@ def tcp_speed(ch):
         ch.send({"cmd": "ping"})
         ch.recv(10)
         best = min(best, (time.time() - t0) * 1000)
-    # ping answering side
     return round(best, 1)
 
 
@@ -912,7 +895,7 @@ run_packet_probe() {
         return 1
     fi
     if [[ ! -x "$WW_BIN" ]]; then
-        echo -e "${RED}[!] WaterWall core is not installed. Use option 4 (Update Core) first.${NC}"
+        echo -e "${RED}[!] WaterWall core is not installed. Use option 4 (Update) first.${NC}"
         return 1
     fi
 
@@ -1069,21 +1052,138 @@ menu_packet_tester() {
     done
 }
 
-menu_update_core() {
-    print_banner
-    echo -e "${BOLD}${MAGENTA}>>> Update WaterWall Core${NC}"
-    echo -e "${BLUE}──────────────────────────────────────────────────────────────────────────${NC}"
-    echo -e "  ${GREEN}1)${NC} Check & Force Re-install Latest WaterWall Core"
-    echo -e "  ${CYAN}0)${NC} Back to Main Menu"
-    echo ""
-    read -rp "$(echo -e "${CYAN}Select an option [0-1]: ${NC}")" up_choice
-    if is_back "$up_choice"; then
-        return 0
-    fi
-    if [[ "$up_choice" == "1" ]]; then
-        check_and_install_core "true"
+menu_update() {
+    while true; do
+        print_banner
+        echo -e "${BOLD}${MAGENTA}>>> Check & Update (Script + WaterWall Core)${NC}"
+        echo -e "${BLUE}──────────────────────────────────────────────────────────────────────────${NC}"
+        echo -e "${CYAN}[*] Checking GitHub for script and WaterWall Core updates...${NC}"
+        echo ""
+
+        ACTIVE_TMP_DIR=$(mktemp -d)
+        local remote_script="${ACTIVE_TMP_DIR}/wwmng.sh"
+        local script_needs_update="false"
+        local script_check_ok="false"
+        local local_hash=""
+        local remote_hash=""
+
+        if curl -fsSL --max-time 10 "$WWMNG_RAW_URL" -o "$remote_script" 2>/dev/null && [[ -s "$remote_script" ]]; then
+            script_check_ok="true"
+            if [[ -f "$WWMNG_BIN" ]]; then
+                local_hash=$(sha256sum "$WWMNG_BIN" 2>/dev/null | awk '{print $1}')
+            else
+                local_hash=$(sha256sum "$0" 2>/dev/null | awk '{print $1}')
+            fi
+            remote_hash=$(sha256sum "$remote_script" 2>/dev/null | awk '{print $1}')
+            if [[ "$local_hash" != "$remote_hash" ]]; then
+                script_needs_update="true"
+            fi
+        fi
+
+        local release_json
+        release_json=$(curl -fsSL --max-time 10 "$WW_API_LATEST" 2>/dev/null)
+        local latest_core_tag=""
+        local installed_core_tag="Not Installed"
+        local core_needs_update="false"
+        local core_check_ok="false"
+
+        if [[ -f "$WW_VER_FILE" ]]; then
+            installed_core_tag=$(cat "$WW_VER_FILE")
+        fi
+
+        if [[ -n "$release_json" ]]; then
+            latest_core_tag=$(echo "$release_json" | jq -r '.tag_name // empty')
+            if [[ -n "$latest_core_tag" ]]; then
+                core_check_ok="true"
+                if [[ ! -x "$WW_BIN" || "$installed_core_tag" != "$latest_core_tag" ]]; then
+                    core_needs_update="true"
+                fi
+            fi
+        fi
+
+        # Display status summary
+        if [[ "$script_check_ok" == "true" ]]; then
+            if [[ "$script_needs_update" == "true" ]]; then
+                echo -e "  * ${BOLD}Waterwall-Manager (wwmng)${NC} : ${YELLOW}Update available${NC} (${local_hash:0:7} -> ${remote_hash:0:7})"
+            else
+                echo -e "  * ${BOLD}Waterwall-Manager (wwmng)${NC} : ${GREEN}Up to date${NC} (${local_hash:0:7})"
+            fi
+        else
+            echo -e "  * ${BOLD}Waterwall-Manager (wwmng)${NC} : ${RED}Could not check GitHub${NC}"
+        fi
+
+        if [[ "$core_check_ok" == "true" ]]; then
+            if [[ "$core_needs_update" == "true" ]]; then
+                echo -e "  * ${BOLD}WaterWall Core${NC}            : ${YELLOW}Update available${NC} (${installed_core_tag} -> ${latest_core_tag})"
+            else
+                echo -e "  * ${BOLD}WaterWall Core${NC}            : ${GREEN}Up to date${NC} (${installed_core_tag})"
+            fi
+        else
+            echo -e "  * ${BOLD}WaterWall Core${NC}            : ${RED}Could not check GitHub${NC}"
+        fi
+
+        echo -e "${BLUE}──────────────────────────────────────────────────────────────────────────${NC}"
+
+        if [[ "$script_needs_update" == "false" && "$core_needs_update" == "false" ]]; then
+            echo -e "${GREEN}[✓] Both Waterwall-Manager and WaterWall Core are already on the latest version.${NC}"
+            echo ""
+            echo -e "  ${GREEN}1)${NC} Force Re-install Both (Script + Core)"
+            echo -e "  ${CYAN}0)${NC} Back to Main Menu"
+            echo ""
+            read -rp "$(echo -e "${CYAN}Select an option [0-1]: ${NC}")" up_choice
+            if is_back "$up_choice" || [[ -z "$up_choice" ]]; then
+                rm -rf "$ACTIVE_TMP_DIR"
+                ACTIVE_TMP_DIR=""
+                return 0
+            fi
+            if [[ "$up_choice" == "1" ]]; then
+                script_needs_update="true"
+                core_needs_update="true"
+            else
+                rm -rf "$ACTIVE_TMP_DIR"
+                ACTIVE_TMP_DIR=""
+                continue
+            fi
+        else
+            echo -e "${YELLOW}Do you want to apply the available update(s) now?${NC}"
+            echo -e "  ${GREEN}1)${NC} Yes, update now"
+            echo -e "  ${CYAN}0)${NC} No, go back"
+            echo ""
+            read -rp "$(echo -e "${CYAN}Select an option [0-1]: ${NC}")" confirm_up
+            if is_back "$confirm_up" || [[ "$confirm_up" != "1" ]]; then
+                rm -rf "$ACTIVE_TMP_DIR"
+                ACTIVE_TMP_DIR=""
+                return 0
+            fi
+        fi
+
+        echo ""
+        local restart_needed="false"
+
+        if [[ "$script_needs_update" == "true" && "$script_check_ok" == "true" ]]; then
+            echo -e "${CYAN}[*] Updating Waterwall-Manager script (${WWMNG_BIN})...${NC}"
+            cp -f "$remote_script" "$WWMNG_BIN"
+            chmod +x "$WWMNG_BIN"
+            echo -e "${GREEN}[✓] Waterwall-Manager script updated successfully.${NC}"
+            restart_needed="true"
+        fi
+
+        rm -rf "$ACTIVE_TMP_DIR"
+        ACTIVE_TMP_DIR=""
+
+        if [[ "$core_needs_update" == "true" && "$core_check_ok" == "true" ]]; then
+            install_or_update_core "$release_json"
+        fi
+
+        if [[ "$restart_needed" == "true" ]]; then
+            echo -e "${GREEN}[*] Reloading wwmng with the new version...${NC}"
+            sleep 1
+            exec "$WWMNG_BIN"
+        fi
+
         pause_back
-    fi
+        return 0
+    done
 }
 
 menu_uninstall() {
@@ -1146,20 +1246,16 @@ menu_uninstall() {
 # ==============================================================================
 
 main_menu() {
-    check_and_install_core "false"
+    ensure_core_present_on_startup
 
     while true; do
         print_banner
-        local current_ver="Not Installed"
-        if [[ -f "$WW_VER_FILE" ]]; then
-            current_ver=$(cat "$WW_VER_FILE")
-        fi
 
         echo -e "${BLUE}──────────────────────────────────────────────────────────────────────────${NC}"
         echo -e "  ${GREEN}1)${NC} Create a Tunnel"
         echo -e "  ${GREEN}2)${NC} Manage Tunnels"
         echo -e "  ${GREEN}3)${NC} Packet Tester (Bidirectional Probe & Speed Test)"
-        echo -e "  ${GREEN}4)${NC} Update Core"
+        echo -e "  ${GREEN}4)${NC} Update"
         echo -e "  ${RED}5)${NC} Uninstall Waterwall-Manager (Wipe Everything)"
         echo -e "  ${CYAN}0)${NC} Exit"
         echo -e "${BLUE}──────────────────────────────────────────────────────────────────────────${NC}"
@@ -1169,7 +1265,7 @@ main_menu() {
             1) menu_create_tunnel ;;
             2) menu_manage_tunnels ;;
             3) menu_packet_tester ;;
-            4) menu_update_core ;;
+            4) menu_update ;;
             5) menu_uninstall ;;
             0|e|exit|q|quit|b|back)
                 echo -e "${GREEN}Exiting Waterwall-Manager. Goodbye!${NC}"
